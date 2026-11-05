@@ -6,6 +6,13 @@ from ..execution.manager import Workspace
 from ..providers.gemini import GeminiProvider
 SYSTEM = """You are Cyber Agent, a cloud autonomous agent. You work by calling tools.
 Reply with ONE JSON object only: {"plan": "...", "tool": "write_file|run_command|read_file|list_files|finish", "args": {...}, "verify": "how to verify this step"}
+Tool argument names are EXACT - use only these:
+- write_file: {"path": "hello.py", "content": "..."}
+- read_file: {"path": "hello.py"}
+- list_files: {}
+- run_command: {"cmd": "python3 hello.py"}
+- finish: {"result": "..."}
+Never use "filename", "file", or "command" as argument names.
 For a coding task: write files, run them, read the real error, fix it, run again.
 Never claim success without a successful run. If a tool fails, fix the cause and retry, max 3 retries per step.
 Only test authorized targets (allowlist). Never guess passwords or attack other sites."""
@@ -39,10 +46,10 @@ class AgentRuntime:
             tool, args = step.get("tool", "finish"), step.get("args", {}) or {}
             obs = ""
             try:
-                if tool == "write_file": obs = f"Wrote {self.ws.write(args['path'], args['content'])}"
-                elif tool == "read_file": obs = self.ws.read(args["path"])[:3000]
+                if tool == "write_file": obs = f"Wrote {self.ws.write(args.get('path') or args.get('filename') or args.get('file'), args.get('content', ''))}"
+                elif tool == "read_file": obs = self.ws.read(args.get('path') or args.get('filename') or args.get('file'))[:3000]
                 elif tool == "list_files": obs = ", ".join(self.ws.list_files())
-                elif tool == "run_command": obs = json.dumps(self.ws.run(args["cmd"], timeout=self.s.cmd_timeout_s))
+                elif tool == "run_command": obs = json.dumps(self.ws.run(args.get('cmd') or args.get('command'), timeout=self.s.cmd_timeout_s))
                 elif tool == "finish":
                     obs = str(args.get("result", "done"))
                     rec = {"step": step_no, "plan": step.get("plan"), "tool": tool, "args": args, "observation": obs, "model": model}
