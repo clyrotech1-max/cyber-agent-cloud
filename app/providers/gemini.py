@@ -1,6 +1,6 @@
 """Gemini provider abstraction. No hardcoded success: a failed call raises."""
 import httpx, json
-MODELS = ["gemini-flash-latest", "gemini-3-flash-preview", "gemini-2.5-flash"]
+MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3-flash-preview", "gemini-2.5-flash"]
 class GeminiProvider:
     def __init__(self, api_key, model="gemini-flash-latest"):
         self.key = api_key; self.model = model
@@ -8,7 +8,7 @@ class GeminiProvider:
         if not self.key:
             raise RuntimeError("GEMINI_API_KEY not set - set it in the cloud backend env, never in chat/repo")
         last = ""
-        for m in [self.model, "gemini-flash-latest", "gemini-2.5-flash"]:
+        for m in dict.fromkeys([self.model] + MODELS):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as c:
                     r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
