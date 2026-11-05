@@ -1,0 +1,21 @@
+# Local / free-tier dev stack. Cloud Run uses the Dockerfile only (no compose).
+# Postgres + Redis are optional here - the API runs on SQLite by default,
+# set DATABASE_URL to use Postgres in production.
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-flash-latest}
+      - DATA_DIR=/srv/data
+    volumes: ["./data:/srv/data"]
+  postgres:
+    image: postgres:16-alpine
+    environment: [POSTGRES_USER=cyber, POSTGRES_PASSWORD=cyber, POSTGRES_DB=cyber]
+    ports: ["5432:5432"]
+    profiles: ["with-db"]
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    profiles: ["with-db"]
