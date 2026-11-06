@@ -3,7 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from .config import settings
+from .config import settings, get_extra_domains, add_extra_domain, remove_extra_domain, all_allowed_domains
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
 app = FastAPI(title="Cyber Agent Cloud", version="0.3")
@@ -33,10 +33,26 @@ def _clean_domain(d):
 def _valid_domain(d):
     return bool(re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", d, re.I))
 def _allowed(host, extra):
-    allowed = set(settings.allowed_domains) | {d for d in (extra or []) if _valid_domain(d)}
+    allowed = set(settings.allowed_domains) | set(get_extra_domains()) | {d for d in (extra or []) if _valid_domain(d)}
     if host in allowed or any(host.endswith("." + d) for d in allowed):
         return True
     return any(host.startswith(p) for p in ["127.", "10.", "192.168."])
+# --- allowlist management (dashboard sidebar <-> backend) ---
+class DomainIn(BaseModel):
+    domain: str = ""
+@app.get("/allowed-domains")
+def list_allowed_domains():
+    return {"allowed_domains": all_allowed_domains(), "server_defaults": settings.allowed_domains, "added": get_extra_domains()}
+@app.post("/allowed-domains")
+def add_allowed_domain(body: DomainIn):
+    d = add_extra_domain(body.domain)
+    if not d:
+        return JSONResponse({"error": "Valid domain likho, jaise example.com."}, status_code=400)
+    return {"ok": True, "domain": d, "allowed_domains": all_allowed_domains()}
+@app.delete("/allowed-domains/{domain}")
+def delete_allowed_domain(domain: str):
+    remove_extra_domain(domain)
+    return {"ok": True, "allowed_domains": all_allowed_domains()}
 _scan_hits = {}
 @app.post("/scan")
 async def scan_endpoint(body: ScanIn, request: Request):
