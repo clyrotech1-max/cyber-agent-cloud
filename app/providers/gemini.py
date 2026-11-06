@@ -5,7 +5,11 @@ import httpx, json
 # (bidiGenerateContent)" - it can never answer a REST generateContent call.
 # Its proper home is a Live API WebSocket session (fast chat), not this loop.
 # Aliases (gemini-flash-latest) and retired models (2.5-flash) removed.
-MODELS = ["gemini-3.8-flash", "gemini-3-flash-preview"]
+# Flash-Lite added as quota fallback: 3.8-flash keeps hitting free-tier 429, and
+# Flash-Lite's free daily allowance is reported far higher. gemini-3.5-flash-lite
+# is stable/GA (21 Jul 2026, no shutdown announced); gemini-3.8-flash-lite is
+# unverified (not in Google's catalog) - tried after it, a 404 just falls through.
+MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash-lite", "gemini-3-flash-preview"]
 class GeminiProvider:
     def __init__(self, api_key, model="gemini-3.8-flash"):
         self.key = api_key; self.model = model
@@ -26,5 +30,5 @@ class GeminiProvider:
                     errors[m] = f"HTTP {r.status_code}: {err[:160]}"
                     if "API key not valid" in err: raise RuntimeError(f"Gemini key invalid: {err}")
             except RuntimeError: raise
-            except Exception as e: errors[m] = f"EXC: {str(e)[:160]}"
+            except Exception as e: errors[m] = f"EXC {type(e).__name__}: {str(e)[:160]}"
         raise RuntimeError("Gemini failed on all models: " + " | ".join(f"{m} -> {str(e)[:250]}" for m, e in errors.items())[:1500])
