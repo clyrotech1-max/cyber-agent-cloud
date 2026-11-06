@@ -6,7 +6,7 @@ from ..config import get_extra_domains
 from ..execution.manager import Workspace
 from ..providers.gemini import GeminiProvider
 from ..scan import run_full_scan
-SYSTEM = """You are Cyber Agent, a cloud autonomous agent. You work by calling tools.
+SYSTEM = """You are Cybnet AI, a cloud autonomous agent. You work by calling tools.
 Reply with ONE JSON object only: {"plan": "...", "tool": "write_file|run_command|read_file|list_files|scan|finish", "args": {...}, "verify": "how to verify this step"}
 Tool argument names are EXACT - use only these:
 - write_file: {"path": "hello.py", "content": "..."}
