@@ -5,13 +5,15 @@ import httpx, json
 # (bidiGenerateContent)" - it can never answer a REST generateContent call.
 # Its proper home is a Live API WebSocket session (fast chat), not this loop.
 # Aliases (gemini-flash-latest) and retired models (2.5-flash) removed.
-# Flash-Lite added as quota fallback: 3.8-flash keeps hitting free-tier 429, and
-# Flash-Lite's free daily allowance is reported far higher. gemini-3.5-flash-lite
-# is stable/GA (21 Jul 2026, no shutdown announced); gemini-3.8-flash-lite is
-# unverified (not in Google's catalog) - tried after it, a 404 just falls through.
-MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash-lite", "gemini-3-flash-preview"]
+# DEFAULT is gemini-3.5-flash-lite: it is the model that passed the live
+# hammadtools.com scan E2E (task 7b90633f5842, 6 Nov 2026) while 3.8-flash was
+# quota-429. Flash-Lite's free daily allowance is reported far higher.
+# gemini-3.5-flash-lite is stable/GA (21 Jul 2026, no shutdown announced);
+# gemini-3.8-flash-lite is unverified (not in Google's catalog) - a 404 just
+# falls through to the next model.
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3-flash-preview"]
 class GeminiProvider:
-    def __init__(self, api_key, model="gemini-3.8-flash"):
+    def __init__(self, api_key, model="gemini-3.5-flash-lite"):
         self.key = api_key; self.model = model
     async def generate(self, prompt, timeout=20):
         if not self.key:
