@@ -6,7 +6,7 @@ service exploit) and a cookie-flags check."""
 import os, re, asyncio, httpx
 from datetime import datetime, timezone
 
-UA = {"User-Agent": "CyberAgent-Cloud/0.3 (defensive-security-check)"}
+UA = {"User-Agent": "CybnetAI-Cloud/0.3 (defensive-security-check)"}
 # Proxy explicitly from env (never log it). trust_env=False avoids httpx choking
 # on malformed NO_PROXY entries like "[::1]". On Render there is no proxy env.
 _PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
@@ -169,7 +169,7 @@ async def run_full_scan(host: str):
 def build_report(scan, target):
     c = scan.get("severityCounts") or {}
     lines = [
-        f"# Cyber Agent Scan Report - {target}", "",
+        f"# Cybnet AI Scan Report - {target}", "",
         f"Scanned: {scan.get('scannedAt') or ''} | URL: {scan.get('url')} | HTTP: {scan.get('status')}",
         f"Severity: HIGH {c.get('high', 0)} | MEDIUM {c.get('medium', 0)} | LOW {c.get('low', 0)} | OK {c.get('ok', 0)}", "",
         "## Findings",

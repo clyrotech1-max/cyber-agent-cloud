@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from .config import settings, get_extra_domains, add_extra_domain, remove_extra_domain, all_allowed_domains
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
-app = FastAPI(title="Cyber Agent Cloud", version="0.3")
+app = FastAPI(title="Cybnet AI Cloud", version="0.3")
 DB = os.path.join(settings.data_dir, "tasks.db")
 os.makedirs(settings.data_dir, exist_ok=True)
 def db():
@@ -80,7 +80,7 @@ class TaskIn(BaseModel):
     target: str | None = None
 runtimes = {}
 @app.get("/health")
-def health(): return {"ok": True, "service": "cyber-agent-cloud", "version": "0.3", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
+def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.3", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
 @app.post("/tasks")
 async def create_task(t: TaskIn):
     tid = uuid.uuid4().hex[:12]
