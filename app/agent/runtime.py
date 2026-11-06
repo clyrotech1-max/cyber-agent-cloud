@@ -2,6 +2,7 @@
 Never simulates success: every step records the real tool output, and the
 task only completes when verification (a real run) passes."""
 import json, time, asyncio
+from ..config import get_extra_domains
 from ..execution.manager import Workspace
 from ..providers.gemini import GeminiProvider
 from ..scan import run_full_scan
@@ -26,7 +27,12 @@ class AgentRuntime:
         self.steps = []; self.cancelled = False
     def _target_allowed(self, host):
         h = (host or "").strip().lower()
-        allowed = set(self.s.allowed_domains)
+        # Server defaults + domains the user added from the dashboard sidebar.
+        # Guardrail stays ON: only allowlisted targets are scanned.
+        allowed = set(self.s.allowed_domains) | set(get_extra_domains())
+        if h in allowed or any(h.endswith("." + d) for d in allowed):
+            return True
+        return any(h.startswith(p) for p in ["127.", "10.", "192.168."])
         if h in allowed or any(h.endswith("." + d) for d in allowed):
             return True
         return any(h.startswith(p) for p in ["127.", "10.", "192.168."])
