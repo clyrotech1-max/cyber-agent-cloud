@@ -69,7 +69,7 @@ def health(): return {"ok": True, "service": "cyber-agent-cloud", "version": "0.
 async def create_task(t: TaskIn):
     tid = uuid.uuid4().hex[:12]
     c = db(); c.execute("INSERT INTO tasks VALUES (?,?,?,?,datetime('now'))", (tid, t.prompt, "running", "")); c.commit(); c.close()
-    rt = AgentRuntime(settings, tid, t.prompt)
+    rt = AgentRuntime(settings, tid, t.prompt, t.target)
     runtimes[tid] = rt
     async def _run():
         try:
