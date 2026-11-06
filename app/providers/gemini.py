@@ -1,14 +1,17 @@
 """Gemini provider abstraction. No hardcoded success: a failed call raises."""
 import httpx, json
-MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3-flash-preview", "gemini-2.5-flash"]
+# gemini-3.8-live = Google's default low-latency model (GA 15 Sep 2026, Live API family).
+# Tried first for fast response; 3.8-flash is the fallback workhorse.
+# Aliases (gemini-flash-latest) and retired models (2.5-flash) removed - they silently swap/fail.
+MODELS = ["gemini-3.8-live", "gemini-3.8-flash", "gemini-3-flash-preview"]
 class GeminiProvider:
-    def __init__(self, api_key, model="gemini-flash-latest"):
+    def __init__(self, api_key, model="gemini-3.8-live"):
         self.key = api_key; self.model = model
-    async def generate(self, prompt, timeout=25):
+    async def generate(self, prompt, timeout=20):
         if not self.key:
             raise RuntimeError("GEMINI_API_KEY not set - set it in the cloud backend env, never in chat/repo")
         errors = {}
-        for m in dict.fromkeys([self.model] + MODELS):
+        for m in dict.fromkeys(MODELS + [self.model]):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as c:
                     r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
