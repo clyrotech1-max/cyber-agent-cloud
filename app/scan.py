@@ -1,7 +1,9 @@
 """Defensive scanner - read-only probes only. Python port of the web lib/scanner.js.
-No login attempts, no password guessing, no form submission, no exploitation.
-Only public HTTP responses."""
-import os, re, httpx
+No login attempts, no password guessing, no form submission, no exploitation,
+no DDoS / load flooding, no login bypass. Only public HTTP responses, a
+TCP-connect port check (nmap-style, top common ports, no banner grab, no
+service exploit) and a cookie-flags check."""
+import os, re, asyncio, httpx
 from datetime import datetime, timezone
 
 UA = {"User-Agent": "CyberAgent-Cloud/0.3 (defensive-security-check)"}
@@ -10,6 +12,25 @@ UA = {"User-Agent": "CyberAgent-Cloud/0.3 (defensive-security-check)"}
 _PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 def _client(**kw):
     return httpx.AsyncClient(trust_env=False, proxy=_PROXY, headers=UA, **kw)
+
+# nmap-style TCP connect check (read-only: open/closed only, no banner grab,
+# no service exploit). Sensitive services exposed to the internet are flagged.
+TOP_PORTS = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios", 143: "imap", 443: "https", 445: "smb", 993: "imaps", 995: "pop3s", 1723: "pptp", 3306: "mysql", 3389: "rdp", 5432: "postgres", 5900: "vnc", 8080: "http-alt", 8443: "https-alt"}
+RISKY_PORTS = {21, 23, 111, 135, 139, 445, 1723, 3306, 3389, 5432, 5900}
+async def _try_port(host, port, timeout=1.5):
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        w.close()
+        return port
+    except Exception:
+        return None
+async def scan_ports(host):
+    sem = asyncio.Semaphore(20)
+    async def one(p):
+        async with sem:
+            return await _try_port(host, p)
+    res = await asyncio.gather(*[one(p) for p in TOP_PORTS])
+    return sorted(p for p in res if p is not None)
 
 async def _probe(client, url, timeout=8.0):
     try:
@@ -58,6 +79,19 @@ async def run_full_scan(host: str):
             add("low", f"Server header leaks version info: {headers['server']} - hide server version")
         if headers["x-powered-by"] != "MISSING":
             add("low", f"X-Powered-By leaks stack: {headers['x-powered-by']} - remove this header")
+        cookies = res.headers.get_list("set-cookie", [])
+        if cookies:
+            bad = []
+            for ck in cookies:
+                name = ck.split(";")[0].strip()
+                low = ck.lower()
+                missing = [f for f in ("secure", "httponly", "samesite") if f not in low]
+                if missing:
+                    bad.append(f"{name} (missing: {', '.join(missing)})")
+            if bad:
+                add("low", "Session cookies missing flags: " + "; ".join(bad) + " - set Secure + HttpOnly + SameSite on auth cookies")
+            else:
+                add("ok", "Session cookies carry Secure + HttpOnly + SameSite flags")
         gen = re.search(r"<meta[^>]*name=[\"']generator[\"'][^>]*>", html, re.I)
         if gen:
             add("low", f"Generator meta tag leaks CMS/version: {gen.group(0)[:120]}")
@@ -102,6 +136,21 @@ async def run_full_scan(host: str):
             add("info", f"Login page found at {login_page} - password guessing was NOT done. Defence check: captcha {'FOUND' if has_captcha else 'NOT seen'}, 2FA mention {'FOUND' if has_2fa else 'NOT seen'}. Fix: rate-limit 5 attempts/minute, lockout after 5 fails, MFA on admin, captcha on login.")
         else:
             add("info", "No common login page found at /wp-login.php, /login, /admin/login - if login exists elsewhere, check its rate-limit + MFA there.")
+        try:
+            open_ports = await scan_ports(host)
+        except Exception:
+            open_ports = []
+        if open_ports:
+            for p in open_ports:
+                svc = TOP_PORTS.get(p, "?")
+                if p in (80, 443):
+                    add("ok", f"Port {p} ({svc}) open - expected for a website")
+                elif p in RISKY_PORTS:
+                    add("medium", f"Port {p} ({svc}) OPEN - sensitive service exposed to the internet, close it or restrict to VPN/internal IPs")
+                else:
+                    add("low", f"Port {p} ({svc}) open - confirm this service should be public")
+        else:
+            add("info", "Port scan (top 22 common ports): no open ports detected - the host may filter TCP probes, or only the website ports answer")
         counts = {"high": 0, "medium": 0, "low": 0, "ok": 0, "info": 0}
         for f in findings:
             if f["severity"] in counts:
@@ -111,6 +160,7 @@ async def run_full_scan(host: str):
             "headers": headers, "tech": tech,
             "exposedFiles": [f"{e['path']} -> {e['status'] or 'no response'}" for e in exposed_files],
             "loginPage": login_page or "not found",
+            "openPorts": [{"port": p, "service": TOP_PORTS.get(p, "?")} for p in open_ports],
             "findings": [f"[{f['severity'].upper()}] {f['text']}" for f in findings],
             "severityCounts": counts,
             "scannedAt": datetime.now(timezone.utc).isoformat(),
@@ -126,9 +176,11 @@ def build_report(scan, target):
         *[f"- {f}" for f in (scan.get("findings") or [])], "",
         "## Exposed files (read-only status check)",
         *[f"- {f}" for f in (scan.get("exposedFiles") or [])], "",
+        "## Open ports (TCP connect, top 22 common ports - no banner grab, no exploit)",
+        *([f"- {p['port']} ({p['service']})" for p in (scan.get("openPorts") or [])] or ["- none detected"]), "",
         "## Login defence",
         f"- Login page: {scan.get('loginPage') or 'not found'} - password guessing was NOT done, only the defence check above.", "",
         "## What was NOT tested",
-        "- No password guessing / brute-force login attempts, no SQLi / XSS payloads, no form submission. Those need a separate authorised penetration test with written scope.",
+        "- No password guessing / brute-force login attempts, no DDoS / load flooding, no login bypass or exploitation, no SQLi / XSS payloads, no form submission. Those are out of scope for this defensive scanner.",
     ]
     return "\n".join(lines)
