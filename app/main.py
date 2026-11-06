@@ -61,12 +61,12 @@ async def scan_endpoint(body: ScanIn, request: Request):
     arr = [t for t in _scan_hits.get(ip, []) if now - t < 60]
     arr.append(now); _scan_hits[ip] = arr
     if len(arr) > 10:
-        return JSONResponse({"error": "Rate limit: 10 scans per minute. 1 minute ruk kar dobara try karo."}, status_code=429)
+        return JSONResponse({"error": "Rate limit: 10 scans per minute. Wait 1 minute and try again."}, status_code=429)
     host = _clean_domain(body.target or "")
     if not host or not _valid_domain(host):
         return JSONResponse({"blocked": True, "reason": f"Valid domain likho, jaise example.com. Mila: {host or '(khali)'}"}, status_code=400)
     if not _allowed(host, body.allowedDomains):
-        return JSONResponse({"blocked": True, "reason": f"Target allowlist me nahi hai: {host}. Sidebar ke 'Allowed Domains' section me apna domain add karo, ya demo ke liye example.com use karo."}, status_code=403)
+        return JSONResponse({"blocked": True, "reason": f"Target is not in the allowlist: {host}. Add your domain in the sidebar under 'Allowed Domains', or use example.com for the demo."}, status_code=403)
     started = time.time()
     try:
         scan = await run_full_scan(host)
