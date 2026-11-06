@@ -7,7 +7,7 @@ class GeminiProvider:
     async def generate(self, prompt, timeout=25):
         if not self.key:
             raise RuntimeError("GEMINI_API_KEY not set - set it in the cloud backend env, never in chat/repo")
-        last = ""
+        errors = {}
         for m in dict.fromkeys([self.model] + MODELS):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as c:
@@ -17,8 +17,9 @@ class GeminiProvider:
                     j = r.json()
                     text = "".join(p.get("text", "") for p in j.get("candidates", [{}])[0].get("content", {}).get("parts", []))
                     if r.status_code == 200 and text: return text, m
-                    last = str(j.get("error", {}).get("message", r.status_code))
-                    if "API key not valid" in last: raise RuntimeError(f"Gemini key invalid: {last}")
+                    err = str(j.get("error", {}).get("message", r.status_code))
+                    errors[m] = f"HTTP {r.status_code}: {err[:160]}"
+                    if "API key not valid" in err: raise RuntimeError(f"Gemini key invalid: {err}")
             except RuntimeError: raise
-            except Exception as e: last = str(e)
-        raise RuntimeError(f"Gemini failed on all models, last error: {last[:200]}")
+            except Exception as e: errors[m] = f"EXC: {str(e)[:160]}"
+        raise RuntimeError("Gemini failed on all models: " + " | ".join(f"{m} -> {e}" for m, e in errors.items())[:1200])
