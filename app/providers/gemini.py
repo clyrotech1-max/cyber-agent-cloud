@@ -1,11 +1,13 @@
 """Gemini provider abstraction. No hardcoded success: a failed call raises."""
 import httpx, json
-# gemini-3.8-live = Google's default low-latency model (GA 15 Sep 2026, Live API family).
-# Tried first for fast response; 3.8-flash is the fallback workhorse.
-# Aliases (gemini-flash-latest) and retired models (2.5-flash) removed - they silently swap/fail.
-MODELS = ["gemini-3.8-live", "gemini-3.8-flash", "gemini-3-flash-preview"]
+# REST loop models only. gemini-3.8-live is NOT here on purpose: Google returns
+# HTTP 400 "only supports real-time bidirectional streaming via WebSocket
+# (bidiGenerateContent)" - it can never answer a REST generateContent call.
+# Its proper home is a Live API WebSocket session (fast chat), not this loop.
+# Aliases (gemini-flash-latest) and retired models (2.5-flash) removed.
+MODELS = ["gemini-3.8-flash", "gemini-3-flash-preview"]
 class GeminiProvider:
-    def __init__(self, api_key, model="gemini-3.8-live"):
+    def __init__(self, api_key, model="gemini-3.8-flash"):
         self.key = api_key; self.model = model
     async def generate(self, prompt, timeout=20):
         if not self.key:
@@ -25,4 +27,4 @@ class GeminiProvider:
                     if "API key not valid" in err: raise RuntimeError(f"Gemini key invalid: {err}")
             except RuntimeError: raise
             except Exception as e: errors[m] = f"EXC: {str(e)[:160]}"
-        raise RuntimeError("Gemini failed on all models: " + " | ".join(f"{m} -> {e}" for m, e in errors.items())[:1200])
+        raise RuntimeError("Gemini failed on all models: " + " | ".join(f"{m} -> {str(e)[:250]}" for m, e in errors.items())[:1500])
