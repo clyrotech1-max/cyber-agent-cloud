@@ -1,7 +1,7 @@
 import os
 class Settings:
     gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
-    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.8-live")
     database_url = os.environ.get("DATABASE_URL", "")  # postgres://... in cloud, else sqlite file
     data_dir = os.environ.get("DATA_DIR", "data")
     max_steps = int(os.environ.get("AGENT_MAX_STEPS", "8"))
