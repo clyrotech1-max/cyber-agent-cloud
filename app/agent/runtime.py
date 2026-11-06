@@ -40,18 +40,26 @@ class AgentRuntime:
         return json.dumps({"target": host, "status": scan.get("status"), "httpsRedirect": scan.get("httpsRedirect"), "severityCounts": scan.get("severityCounts"), "findings": scan.get("findings"), "exposedFiles": scan.get("exposedFiles"), "loginPage": scan.get("loginPage")})[:6000]
     def cancel(self): self.cancelled = True
     async def _llm_step(self, history):
-        try:
-            task_line = "\n\nTask: " + self.prompt
-            if self.target:
-                task_line += f"\nTarget: {self.target} (owner-authorized, allowlisted)"
-            text, model = await self.provider.generate(SYSTEM + task_line + "\n\nHistory (real tool outputs):\n" + json.dumps(history[-6:], indent=2)[:6000])
-            # extract first JSON object
+        task_line = "\n\nTask: " + self.prompt
+        if self.target:
+            task_line += f"\nTarget: {self.target} (owner-authorized, allowlisted)"
+        base = SYSTEM + task_line + "\n\nHistory (real tool outputs):\n" + json.dumps(history[-6:], indent=2)[:6000]
+        last_raw = ""
+        for attempt in range(2):
+            text, model = await self.provider.generate(base if attempt == 0 else base + "\n\nYour last reply was not valid JSON. Reply with ONLY the JSON object, no other text, no markdown fences.")
+            last_raw = text
             start, end = text.find("{"), text.rfind("}")
-            if start < 0: raise ValueError("LLM returned no JSON")
-            return json.loads(text[start:end+1]), model
-        except Exception as e:
-            # No fake success: if the LLM is unavailable, the step fails honestly.
-            raise
+            if start < 0:
+                if attempt == 0:
+                    continue
+                raise ValueError(f"LLM returned no JSON (model {model}, raw: {text[:300]!r})")
+            try:
+                return json.loads(text[start:end+1]), model
+            except Exception:
+                if attempt == 0:
+                    continue
+                raise ValueError(f"LLM returned invalid JSON (model {model}, raw: {text[:300]!r})")
+        raise ValueError(f"LLM returned no JSON, raw: {last_raw[:300]!r}")
     async def run(self, on_step=None):
         history = []
         t0 = time.time()
