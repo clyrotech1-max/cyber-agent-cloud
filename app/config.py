@@ -8,7 +8,11 @@ class Settings:
     task_timeout_s = int(os.environ.get("AGENT_TASK_TIMEOUT_S", "180"))
     cmd_timeout_s = int(os.environ.get("AGENT_CMD_TIMEOUT_S", "30"))
     max_workspace_mb = int(os.environ.get("AGENT_MAX_WORKSPACE_MB", "100"))
-    allowed_domains = [d.strip() for d in os.environ.get("ALLOWED_DOMAINS", "example.com,example.org,hammadtools.com").split(",") if d.strip()]
+    # Server defaults are the durable seed: we.hammadgfx.online is hammad's own
+    # portfolio site, added via the sidebar after every deploy until now. The
+    # backend DB is ephemeral (wiped on every Render restart/redeploy), so the
+    # seed keeps it allowlisted from startup. Env ALLOWED_DOMAINS overrides.
+    allowed_domains = [d.strip() for d in os.environ.get("ALLOWED_DOMAINS", "example.com,example.org,hammadtools.com,we.hammadgfx.online").split(",") if d.strip()]
 settings = Settings()
 
 # --- sidebar-added allowlist domains (saved in the same SQLite DB as chats) ---
