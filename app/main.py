@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from .config import settings, get_extra_domains, add_extra_domain, remove_extra_domain, all_allowed_domains
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
+from . import auth as authmod
 app = FastAPI(title="Cybnet AI Cloud", version="0.3")
 DB = os.path.join(settings.data_dir, "tasks.db")
 os.makedirs(settings.data_dir, exist_ok=True)
@@ -15,6 +16,99 @@ def db():
 # --- chat history is NOT stored on the server (privacy): chats live only in
 # each user's own browser (localStorage), so no user's chats can ever leak to
 # another user. There is intentionally no /chats endpoint. ---
+# --- auth (email + password, optional: the web works without login, but
+# agent work needs a login) ---
+def _bearer_token(request: Request):
+    h = request.headers.get("authorization") or ""
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return request.headers.get("x-auth-token") or ""
+
+def _current_user(request: Request):
+    return authmod.get_user_by_token(_bearer_token(request))
+
+def _require_user(request: Request):
+    u = _current_user(request)
+    if not u:
+        return None
+    return u
+
+class AuthIn(BaseModel):
+    email: str = ""
+    password: str = ""
+class ChangePwIn(BaseModel):
+    old_password: str = ""
+    new_password: str = ""
+class UserChatsIn(BaseModel):
+    chats: list = []
+class UserSettingsIn(BaseModel):
+    settings: dict = {}
+@app.post("/auth/register")
+def auth_register(body: AuthIn):
+    try:
+        user, token = authmod.register(body.email, body.password)
+        return {"ok": True, "user": user, "token": token}
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+@app.post("/auth/login")
+def auth_login(body: AuthIn):
+    try:
+        user, token = authmod.login(body.email, body.password)
+        return {"ok": True, "user": user, "token": token}
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    authmod.logout(_bearer_token(request))
+    return {"ok": True}
+@app.get("/auth/me")
+def auth_me(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    return {"ok": True, "user": u}
+@app.post("/auth/change-password")
+def auth_change_password(body: ChangePwIn, request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    try:
+        token = authmod.change_password(u["id"], body.old_password, body.new_password)
+        return {"ok": True, "token": token}
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+@app.delete("/auth/account")
+def auth_delete_account(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    authmod.delete_account(u["id"])
+    return {"ok": True}
+@app.get("/user/chats")
+def user_get_chats(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    return {"ok": True, "chats": authmod.get_user_chats(u["id"])}
+@app.post("/user/chats")
+def user_save_chats(body: UserChatsIn, request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    authmod.save_user_chats(u["id"], body.chats)
+    return {"ok": True, "count": len(body.chats)}
+@app.get("/user/settings")
+def user_get_settings(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    return {"ok": True, "settings": authmod.get_user_settings(u["id"])}
+@app.post("/user/settings")
+def user_save_settings(body: UserSettingsIn, request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    return {"ok": True, "settings": authmod.save_user_settings(u["id"], body.settings)}
 # --- defensive scan (same guardrail + checks as the web scanner) ---
 class ScanIn(BaseModel):
     target: str | None = None
@@ -47,6 +141,9 @@ def delete_allowed_domain(domain: str):
 _scan_hits = {}
 @app.post("/scan")
 async def scan_endpoint(body: ScanIn, request: Request):
+    # Work needs a login (the agent says so in chat when logged out).
+    if not _current_user(request):
+        return JSONResponse({"login_required": True, "error": "Pehly login karein, phir scan hoga."}, status_code=401)
     ip = (request.headers.get("x-forwarded-for") or "unknown").split(",")[0].strip()
     now = time.time()
     arr = [t for t in _scan_hits.get(ip, []) if now - t < 60]
@@ -69,14 +166,19 @@ async def scan_endpoint(body: ScanIn, request: Request):
 class TaskIn(BaseModel):
     prompt: str
     target: str | None = None
+    language: str | None = None
 runtimes = {}
 @app.get("/health")
 def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.3", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
 @app.post("/tasks")
-async def create_task(t: TaskIn):
+async def create_task(t: TaskIn, request: Request):
     tid = uuid.uuid4().hex[:12]
     c = db(); c.execute("INSERT INTO tasks VALUES (?,?,?,?,datetime('now'))", (tid, t.prompt, "running", "")); c.commit(); c.close()
-    rt = AgentRuntime(settings, tid, t.prompt, t.target)
+    # Login is optional to open/use the web, but agent WORK needs a login:
+    # the runtime answers greetings + general questions when logged out, and
+    # asks the user to log in first for any work needing tools.
+    u = _current_user(request)
+    rt = AgentRuntime(settings, tid, t.prompt, t.target, authed=bool(u), user_id=u["id"] if u else None, language=t.language)
     runtimes[tid] = rt
     async def _run():
         try:
