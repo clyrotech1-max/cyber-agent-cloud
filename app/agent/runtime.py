@@ -88,6 +88,11 @@ class AgentRuntime:
                 step, model = await self._llm_step(history)
             except Exception as e:
                 return {"status": "failed", "error": str(e), "steps": self.steps}
+            # Stop takes effect even mid-step: if the user cancelled while the
+            # LLM was thinking, do not execute this step (a finish in flight
+            # must not turn a cancelled task into "completed").
+            if self.cancelled:
+                return {"status": "cancelled", "steps": self.steps}
             tool, args = step.get("tool", "finish"), step.get("args", {}) or {}
             obs = ""
             try:
