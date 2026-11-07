@@ -10,20 +10,11 @@ app = FastAPI(title="Cybnet AI Cloud", version="0.3")
 DB = os.path.join(settings.data_dir, "tasks.db")
 os.makedirs(settings.data_dir, exist_ok=True)
 def db():
-    c = sqlite3.connect(DB); c.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, prompt TEXT, status TEXT, result TEXT, created TEXT)"); c.execute("CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, data TEXT)")
+    c = sqlite3.connect(DB); c.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, prompt TEXT, status TEXT, result TEXT, created TEXT)")
     return c
-# --- chat history (persisted in backend so chats survive refresh / other devices) ---
-class ChatsIn(BaseModel):
-    chats: list = []
-@app.get("/chats")
-def get_chats():
-    c = db(); row = c.execute("SELECT data FROM chats WHERE id='main'").fetchone(); c.close()
-    return {"chats": json.loads(row[0]) if row and row[0] else []}
-@app.post("/chats")
-def save_chats(body: ChatsIn):
-    data = json.dumps(body.chats)[:500000]
-    c = db(); c.execute("INSERT INTO chats VALUES ('main', ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (data,)); c.commit(); c.close()
-    return {"ok": True, "count": len(body.chats)}
+# --- chat history is NOT stored on the server (privacy): chats live only in
+# each user's own browser (localStorage), so no user's chats can ever leak to
+# another user. There is intentionally no /chats endpoint. ---
 # --- defensive scan (same guardrail + checks as the web scanner) ---
 class ScanIn(BaseModel):
     target: str | None = None
