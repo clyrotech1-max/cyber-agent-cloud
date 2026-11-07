@@ -90,7 +90,15 @@ async def create_task(t: TaskIn):
     async def _run():
         try:
             out = await rt.run()
-            c = db(); c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", (out.get("status"), json.dumps(out)[:20000], tid)); c.commit(); c.close()
+            c = db()
+            # A task the user cancelled stays cancelled: a late "completed"
+            # from an in-flight step must not overwrite the cancelled status.
+            cur = c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+            if cur and cur[0] == "cancelled":
+                c.execute("UPDATE tasks SET result=? WHERE id=?", (json.dumps(out)[:20000], tid))
+            else:
+                c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", (out.get("status"), json.dumps(out)[:20000], tid))
+            c.commit(); c.close()
         except Exception as e:
             c = db(); c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", ("failed", str(e), tid)); c.commit(); c.close()
     asyncio.create_task(_run())
