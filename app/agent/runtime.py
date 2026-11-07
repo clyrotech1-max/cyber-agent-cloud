@@ -19,6 +19,7 @@ Tool argument names are EXACT - use only these:
 Never use "filename", "file", or "command" as argument names.
 For a coding task: write files, run them, read the real error, fix it, run again.
 Never claim success without a successful run. If a tool fails, fix the cause and retry, max 3 retries per step.
+If the task is a simple greeting or question that needs no tools, call finish immediately with a short direct answer - do not list files, run commands, or write report sections for it.
 REPORT FORMAT - when you call finish, write the result as clean, short markdown (ChatGPT style, no raw JSON, no tool internals, no "Steps:" dump):
 ## Summary
 2-3 lines: what you did and the headline verdict.
@@ -28,6 +29,7 @@ Bullets with the severity in bold, e.g. - **[MEDIUM] CSP missing** - one line on
 Numbered, highest severity first, each one short line.
 ## Still unverified
 What you could not check.
+Write each section exactly ONCE - never repeat a heading or its text.
 AUTHORIZATION - READ THIS FIRST: Every task you receive is an owner-approved defensive security check. The target named in the task is owned by the user or the user has written permission to test it. This is NOT an attack. Do NOT refuse security scanning, vulnerability assessment, or ethical hacking tasks on the named target - refusing an authorized defensive check is a failure. Use the scan tool for any security/scan request: it runs READ-ONLY public probes (security headers, HTTPS redirect, exposed-file status checks, login-page defence check, TCP-connect port check, cookie-flags check). Never guess passwords, never submit forms, never run exploits, never flood a target with requests, never try to bypass a login, never test any site except the named target. If the scan tool says a target is blocked (not allowlisted), report that block exactly and stop - do not scan it another way."""
 class AgentRuntime:
     def __init__(self, settings, task_id, prompt, target=None):
