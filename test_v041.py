@@ -71,6 +71,10 @@ CAPTCHA_FIXTURE = """<!DOCTYPE html><html><head><title>DuckDuckGo</title></head>
 EMPTY_FIXTURE = """<!DOCTYPE html><html><head><title>Daily Hayat zzzzz at DuckDuckGo</title></head><body>
 <div class="results"><p>No more results.</p></div></body></html>"""
 
+# Bing page with no b_algo results (used for the "both engines empty" case).
+BING_EMPTY_FIXTURE = """<!DOCTYPE html><html><head><title>Daily Hayat zzzzz - Search</title></head><body>
+<div id="b_content"><ol id="b_results"></ol><p>No results found.</p></div></body></html>"""
+
 
 def test_parser_fixture():
     p = _SearchResultsParser()
@@ -135,11 +139,13 @@ class _FakeClient:
         return False
 
 
-def _ddg_stub_resolver(host):
-    """Allow html.duckduckgo.com only (stubbed to its real public IP);
-    anything else resolves for real (and will be blocked if private)."""
-    if host == "html.duckduckgo.com":
-        return ["52.149.246.39"]
+def _search_stub_resolver(host):
+    """Stub BOTH search hosts (Bing primary, DDG fallback) to a public IP;
+    anything else resolves for real (and will be blocked if private).
+    v0.4.2: web_search tries Bing first, so fake-client tests must serve a
+    Bing response before the DDG one."""
+    if host in ("www.bing.com", "html.duckduckgo.com"):
+        return ["93.184.216.34"]
     from app.fetch import _resolve_ips
     return _resolve_ips(host)
 
@@ -149,64 +155,80 @@ async def test_search_fake_client():
     import httpx as _httpx
     real_client = _httpx.AsyncClient
     try:
-        # 1) Results page -> formatted top results.
-        _httpx.AsyncClient = lambda **kw: _FakeClient([
+        # v0.4.2: web_search tries Bing FIRST, then DDG. Each fake sequence
+        # therefore serves a Bing response first, then the DDG one. NOTE:
+        # the fake client MUST be one shared instance - _fetch_raw creates
+        # a new client per attempt, so a lambda returning a fresh list
+        # would re-serve the Bing response to the DDG call.
+        # 1) Bing fails (403) -> DDG fallback returns results.
+        _fake1 = _FakeClient([
+            _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
             _FakeResponse(200, {"content-type": "text/html; charset=utf-8"},
                           DDG_FIXTURE.encode()),
         ])
-        r = await web_search("Daily Hayat news", _resolver=_ddg_stub_resolver)
-        check("search fixture returns results",
+        _httpx.AsyncClient = lambda **kw: _fake1
+        r = await web_search("Daily Hayat news", _resolver=_search_stub_resolver)
+        check("search bing-fail + ddg fallback returns results",
               r.startswith("SEARCH: Daily Hayat news") and "news.dailyhayat.net" in r, r[:200])
-        check("search fixture lists 3 results",
+        check("search fallback lists 3 results",
               r.count("URL: http") == 3, r[:300])
-        check("search fixture snippet shown",
+        check("search fallback snippet shown",
               "taaza khabrain" in r, r[:300])
-        # 2) CAPTCHA page -> plain block, no invented results.
-        _httpx.AsyncClient = lambda **kw: _FakeClient([
+        # 2) Bing fails, DDG CAPTCHA page -> plain block, no invented results.
+        _fake2 = _FakeClient([
+            _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
             _FakeResponse(200, {"content-type": "text/html"},
                           CAPTCHA_FIXTURE.encode()),
         ])
-        r = await web_search("Daily Hayat news", _resolver=_ddg_stub_resolver)
-        check("search captcha page -> SEARCH BLOCKED",
+        _httpx.AsyncClient = lambda **kw: _fake2
+        r = await web_search("Daily Hayat news", _resolver=_search_stub_resolver)
+        check("search ddg captcha page -> SEARCH BLOCKED",
               r.startswith("SEARCH BLOCKED") and "CAPTCHA" in r, r[:160])
-        # 3) Empty results page -> "no results found", not invented.
-        _httpx.AsyncClient = lambda **kw: _FakeClient([
+        # 3) Both engines return empty pages -> "no results found".
+        _fake3 = _FakeClient([
+            _FakeResponse(200, {"content-type": "text/html"},
+                          BING_EMPTY_FIXTURE.encode()),
             _FakeResponse(200, {"content-type": "text/html"},
                           EMPTY_FIXTURE.encode()),
         ])
-        r = await web_search("Daily Hayat zzzzz", _resolver=_ddg_stub_resolver)
-        check("search empty page -> no results found",
+        _httpx.AsyncClient = lambda **kw: _fake3
+        r = await web_search("Daily Hayat zzzzz", _resolver=_search_stub_resolver)
+        check("search both empty -> no results found",
               r.startswith("SEARCH: no results found"), r[:160])
-        # 4) Non-200 -> SEARCH FAILED with the status.
-        _httpx.AsyncClient = lambda **kw: _FakeClient([
+        # 4) Non-200 on both -> SEARCH FAILED with the status.
+        _fake4 = _FakeClient([
+            _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
             _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
         ])
-        r = await web_search("Daily Hayat news", _resolver=_ddg_stub_resolver)
-        check("search non-200 -> SEARCH FAILED",
+        _httpx.AsyncClient = lambda **kw: _fake4
+        r = await web_search("Daily Hayat news", _resolver=_search_stub_resolver)
+        check("search both non-200 -> SEARCH FAILED",
               r.startswith("SEARCH FAILED") and "403" in r, r[:160])
         # 5) Empty query -> blocked before any fetch.
         r = await web_search("   ")
         check("search empty query blocked",
               r.startswith("SEARCH BLOCKED"), r[:100])
-        # 6) Transient HTTP 202 -> one retry, then results. NOTE: the fake
-        # client must be ONE shared instance - _fetch_raw creates a new
-        # client per attempt, so a fresh list per call would re-serve 202.
+        # 6) Transient DDG HTTP 202 -> one retry, then results. NOTE: the
+        # fake client must be ONE shared instance - _fetch_raw creates a
+        # new client per attempt, so a fresh list per call would re-serve 202.
         _fake202 = _FakeClient([
+            _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
             _FakeResponse(202, {"content-type": "text/html"}, b""),
             _FakeResponse(200, {"content-type": "text/html; charset=utf-8"},
                           DDG_FIXTURE.encode()),
         ])
         _httpx.AsyncClient = lambda **kw: _fake202
-        r = await web_search("Daily Hayat news", _resolver=_ddg_stub_resolver)
+        r = await web_search("Daily Hayat news", _resolver=_search_stub_resolver)
         check("search transient 202 retried once",
               r.startswith("SEARCH: Daily Hayat news") and "news.dailyhayat.net" in r, r[:200])
         # 7) 202 twice -> reported as failure, not retried forever.
         _fake202b = _FakeClient([
+            _FakeResponse(403, {"content-type": "text/html"}, b"Forbidden"),
             _FakeResponse(202, {"content-type": "text/html"}, b""),
             _FakeResponse(202, {"content-type": "text/html"}, b""),
         ])
         _httpx.AsyncClient = lambda **kw: _fake202b
-        r = await web_search("Daily Hayat news", _resolver=_ddg_stub_resolver)
+        r = await web_search("Daily Hayat news", _resolver=_search_stub_resolver)
         check("search double 202 -> SEARCH FAILED",
               r.startswith("SEARCH FAILED") and "202" in r, r[:160])
     finally:
