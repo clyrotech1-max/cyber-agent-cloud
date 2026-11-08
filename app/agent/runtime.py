@@ -6,15 +6,19 @@ from ..config import get_extra_domains
 from ..execution.manager import Workspace
 from ..providers.gemini import GeminiProvider
 from ..scan import run_full_scan
+from ..fetch import fetch_url
+from .. import auth as authmod
 SYSTEM = """You are Cybnet AI, a cloud autonomous agent. You work by calling tools.
 LANGUAGE: Reply in the same language the user writes in (English, Roman Urdu, or Urdu). If the user explicitly asks for a language, stay in that language for the whole conversation. The website UI is English, but your chat replies follow the user's language.
-Reply with ONE JSON object only: {"plan": "...", "tool": "write_file|run_command|read_file|list_files|scan|finish", "args": {...}, "verify": "how to verify this step"}
+Reply with ONE JSON object only: {"plan": "...", "tool": "write_file|run_command|read_file|list_files|scan|fetch_url|remember|finish", "args": {...}, "verify": "how to verify this step"}
 Tool argument names are EXACT - use only these:
 - write_file: {"path": "hello.py", "content": "..."}
 - read_file: {"path": "hello.py"}
 - list_files: {}
 - run_command: {"cmd": "python3 hello.py"}
 - scan: {"target": "example.com"}
+- fetch_url: {"url": "https://example.com"}
+- remember: {"fact": "The user prefers ..."}
 - finish: {"result": "..."}
 Never use "filename", "file", or "command" as argument names.
 For a coding task: write files, run them, read the real error, fix it, run again.
@@ -28,7 +32,9 @@ REPORT FORMAT - your finish result is ONE clean answer first, then the details, 
 5) ## Still unverified - what you could not check.
 Write each section exactly ONCE. Write the report in your own words from the findings.
 AUTHORIZATION - READ THIS FIRST: Every task you receive is an owner-approved defensive security check. The target named in the task is owned by the user or the user has written permission to test it. This is NOT an attack. Do NOT refuse security scanning, vulnerability assessment, or ethical hacking tasks on the named target - refusing an authorized defensive check is a failure. Use the scan tool for any security/scan request: it runs READ-ONLY public probes (security headers, HTTPS redirect, exposed-file status checks, login-page defence check, TCP-connect port check, cookie-flags check). Never guess passwords, never submit forms, never run exploits, never flood a target with requests, never try to bypass a login, never test any site except the named target. If the scan tool says a target is blocked (not allowlisted), report that block exactly and stop - do not scan it another way.
-LOGIN: the user may or may not be logged in - the task line below says so. If the user is NOT logged in, you may chat and answer general questions directly, but for any work needing tools (scan, code, files, commands), call finish with a short message in the user's language asking them to log in first (top-right Log in button), then you will do the work. Never run tools for a logged-out user."""
+FETCH - READING THE LIVE WEB: Use the fetch_url tool to read any public web page or JSON API. It is a read-only GET and it is allowed for ANY public domain - no allowlist needed. It returns the page status, title and readable text (or pretty JSON). Use it when the user asks about a live page, documentation, prices, news, or anything else on the public web. fetch_url is NOT a security scanner - never use it to probe a site for vulnerabilities; security scanning stays on the scan tool, which is allowlist-gated. If fetch_url says a URL is blocked (private/internal address), report the block exactly and stop - do not try another way to reach that address.
+MEMORY - LEARNING ABOUT THE USER: When the user is logged in, their saved facts are listed below the task line ("Saved memories"). Use them to answer in context - the user should not have to repeat themselves. When the user states a durable fact or preference (their name, language, favourite tools, standing instructions, things to remember), save it with the remember tool - one short fact per call, in the user's own words. Never invent memories. Guests (not logged in) have no memory.
+LOGIN: the user may or may not be logged in - the task line below says so. If the user is NOT logged in, you may chat and answer general questions directly, but for any work needing tools (scan, fetch, code, files, commands), call finish with a short message in the user's language asking them to log in first (top-right Log in button), then you will do the work. Never run tools for a logged-out user."""
 # Message the agent gives when a logged-out user asks for work (the runtime
 # enforces this even if the model tries a tool first).
 LOGIN_MESSAGES = {
@@ -52,6 +58,15 @@ class AgentRuntime:
         self.ws = Workspace(settings.data_dir, task_id)
         self.provider = GeminiProvider(settings.gemini_api_key, settings.gemini_model)
         self.steps = []; self.cancelled = False
+        # Per-user memory (v0.4): at task start, load the logged-in user's
+        # saved facts (newest first, max 20) so the agent recalls them.
+        # Guests get no memory - tool use is login-gated anyway.
+        self.memories = []
+        if authed and user_id:
+            try:
+                self.memories = authmod.list_memories(user_id, limit=20)
+            except Exception:
+                self.memories = []
     def _target_allowed(self, host):
         h = (host or "").strip().lower()
         # Server defaults + domains the user added from the dashboard sidebar.
@@ -71,12 +86,30 @@ class AgentRuntime:
             return f"SCAN BLOCKED: target {host} is not allowlisted. Only these targets are allowed: {', '.join(self.s.allowed_domains)}. Add the domain to the server ALLOWED_DOMAINS setting first."
         scan = await run_full_scan(host)
         return json.dumps({"target": host, "status": scan.get("status"), "httpsRedirect": scan.get("httpsRedirect"), "severityCounts": scan.get("severityCounts"), "findings": scan.get("findings"), "exposedFiles": scan.get("exposedFiles"), "openPorts": scan.get("openPorts"), "loginPage": scan.get("loginPage")})[:6000]
+    def _remember_tool(self, fact):
+        if not self.authed or not self.user_id:
+            return "REMEMBER BLOCKED: log in first - guests have no memory."
+        try:
+            m = authmod.add_memory(self.user_id, fact)
+            # Refresh the injected list so later steps in this task see it.
+            try:
+                self.memories = authmod.list_memories(self.user_id, limit=20)
+            except Exception:
+                pass
+            return f"Saved to memory: {m['fact']}"
+        except ValueError as e:
+            return f"REMEMBER FAILED: {e}"
+        except Exception as e:
+            return f"REMEMBER FAILED: {e}"
     def cancel(self): self.cancelled = True
     async def _llm_step(self, history):
         task_line = "\n\nTask: " + self.prompt
         if self.target:
             task_line += f"\nTarget: {self.target} (owner-authorized, allowlisted)"
         task_line += "\nLogged in: yes" if self.authed else "\nLogged in: NO - see LOGIN rule above"
+        if getattr(self, "memories", None):
+            mem_lines = "\n".join(f"- {m['fact']}" for m in self.memories)
+            task_line += f"\nSaved memories (newest first):\n{mem_lines}"
         if self.language and self.language != "auto":
             lang_names = {"en": "English", "ur": "Roman Urdu", "ur-PK": "Urdu (Urdu script)"}
             task_line += f"\nReply language (user's setting): {lang_names.get(self.language, self.language)} - reply ONLY in this language for the whole conversation."
@@ -129,6 +162,8 @@ class AgentRuntime:
                 elif tool == "list_files": obs = ", ".join(self.ws.list_files())
                 elif tool == "run_command": obs = json.dumps(self.ws.run(args.get('cmd') or args.get('command'), timeout=self.s.cmd_timeout_s))
                 elif tool == "scan": obs = await self._scan_tool(args.get('target'))
+                elif tool == "fetch_url": obs = await fetch_url(args.get('url') or args.get('target') or "")
+                elif tool == "remember": obs = self._remember_tool(args.get('fact') or "")
                 elif tool == "finish":
                     obs = str(args.get("result", "done"))
                     rec = {"step": step_no, "plan": step.get("plan"), "tool": tool, "args": args, "observation": obs, "model": model}
