@@ -1,5 +1,13 @@
 """SSRF-safe read-only web fetch (the agent's `fetch_url` tool) and
-web search (the agent's `web_search` tool, via DuckDuckGo HTML).
+web search (the agent's `web_search` tool).
+
+Search engine order (v0.4.2): Bing HTML is primary, DuckDuckGo HTML is
+the fallback. Reason: DuckDuckGo (html.duckduckgo.com and
+lite.duckduckgo.com) times out from Render's datacenter IP (20s, twice,
+live-verified 8 Nov 2026), while Bing search returns 200 from Render
+with real results. If Bing fails (non-200 / timeout / CAPTCHA / zero
+results), DuckDuckGo is tried once; if both fail, that fact is reported
+plainly - results are never invented.
 
 Reads any PUBLIC web page or JSON API with a plain GET. Security rules:
 - Only http/https, no credentials in the URL, no cookies sent.
@@ -29,6 +37,7 @@ scripts, styles, nav, noscript and svg are stripped; headings,
 paragraphs, list items and links (text + href) are kept.
 """
 import asyncio
+import base64
 import html as _html  # noqa: F401  (kept for clarity; parser unescapes)
 import ipaddress
 import json
@@ -54,10 +63,11 @@ _PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 UA = {"User-Agent": "CybnetAI-Cloud/0.4 (read-only-fetch)",
       "Accept": "text/html,application/json,*/*"}
 
-# Web search (v0.4.1): DuckDuckGo HTML endpoint. A browser-like UA is used
-# because the html endpoint serves results pages to browsers; it is not a
-# block bypass - if DDG answers with a CAPTCHA/block page, web_search
-# reports that plainly and never invents results.
+# Web search (v0.4.1/v0.4.2): Bing HTML is primary, DuckDuckGo HTML the
+# fallback. A browser-like UA is used because both endpoints serve results
+# pages to browsers; it is not a block bypass - if either answers with a
+# CAPTCHA/block page, web_search reports that plainly and never invents
+# results.
 SEARCH_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
              "Accept": "text/html,*/*"}
 SEARCH_MAX_RESULTS = 8
@@ -363,25 +373,166 @@ class _SearchResultsParser(HTMLParser):
             self._buf.append(data)
 
 
-# Markers of a DDG block/CAPTCHA page. Only treated as a block when the
-# page also yields ZERO results (a legit snippet may mention "captcha").
-_BLOCK_MARKERS = ("captcha", "unusual traffic", "automated requests",
-                  "anomaly", "request was filtered")
+# --- Bing HTML search results parsing (stdlib html.parser only) ---
+def _decode_bing_u(u):
+    """Decode a Bing /ck/a redirect `u` parameter to the real target URL.
 
-
-async def web_search(query: str, _resolver=None) -> str:
-    """Search the public web via DuckDuckGo HTML. Returns the top ~8
-    results as title + URL + snippet.
-
-    Reuses the same SSRF-safe machinery as fetch_url (html.duckduckgo.com
-    is validated as a public host, 20s timeout, size caps). No cookies,
-    no credentials. If the search page blocks us or returns nothing, that
-    fact is returned plainly - results are never invented.
+    Bing prefixes the base64url-encoded target with "a1" (a version
+    marker), so the whole value does not decode to a URL - try it whole
+    first, then with the 2-char prefix stripped. Returns "" when neither
+    decodes to an http(s) URL.
     """
-    q = (query or "").strip()
-    if not q:
-        return "SEARCH BLOCKED: no query given."
-    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(q)
+    for cand in (u, u[2:]):
+        s = cand.replace("-", "+").replace("_", "/")
+        s += "=" * (-len(s) % 4)
+        try:
+            dec = base64.b64decode(s).decode("utf-8", "replace").strip()
+        except Exception:
+            continue
+        if dec.startswith("http://") or dec.startswith("https://"):
+            return dec
+    return ""
+
+
+def _bing_real_url(href):
+    """Recover the real target URL from a Bing result link."""
+    href = _html.unescape((href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    p = urlparse(href)
+    if "bing.com" in (p.netloc or "") and p.path.startswith("/ck/a"):
+        u = parse_qs(p.query).get("u", [None])[0]
+        if u:
+            return _decode_bing_u(u)
+        return ""
+    if p.scheme in ("http", "https"):
+        return href
+    return ""
+
+
+class _BingResultsParser(HTMLParser):
+    """Parses Bing search results: <li class="b_algo"> blocks with an
+    <h2><a> title link and a <p> snippet (first paragraph in the block).
+    Result links are Bing /ck/a redirects (decoded via _bing_real_url);
+    plain http(s) hrefs are used as-is. Pagination / chrome <li> blocks
+    (e.g. class b_pag) are ignored - only b_algo blocks count."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results = []  # list of dicts {title, url, snippet}
+        self._in_algo = False
+        self._li_depth = 0
+        self._cur = None
+        self._capture = None  # "title" | "snippet" | None
+        self._buf = []
+        self._in_h2 = False
+        self._got_snippet = False
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag == "li":
+            if not self._in_algo and "b_algo" in d.get("class", "").split():
+                self._in_algo = True
+                self._li_depth = 1
+                self._cur = {"title": "", "url": "", "snippet": ""}
+                self._capture = None
+                self._got_snippet = False
+            elif self._in_algo:
+                self._li_depth += 1
+            return
+        if not self._in_algo or self._cur is None:
+            return
+        if tag == "h2":
+            self._in_h2 = True
+        elif tag == "a" and self._in_h2 and not self._cur["url"]:
+            url = _bing_real_url(d.get("href", ""))
+            if url:
+                self._cur["url"] = url
+                self._capture = "title"
+                self._buf = []
+        elif tag == "p" and not self._got_snippet and self._capture != "title":
+            self._capture = "snippet"
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        if tag == "li" and self._in_algo:
+            self._li_depth -= 1
+            if self._li_depth == 0:
+                if self._cur is not None and self._cur["title"] and self._cur["url"]:
+                    self.results.append(self._cur)
+                self._in_algo = False
+                self._cur = None
+                self._capture = None
+            return
+        if not self._in_algo or self._cur is None:
+            return
+        if tag == "h2":
+            self._in_h2 = False
+        elif tag == "a" and self._capture == "title":
+            self._cur["title"] = " ".join("".join(self._buf).split())
+            self._capture = None
+            self._buf = []
+        elif tag == "p" and self._capture == "snippet":
+            self._cur["snippet"] = " ".join("".join(self._buf).split())
+            self._got_snippet = True
+            self._capture = None
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._in_algo and self._capture is not None:
+            self._buf.append(data)
+
+
+# Markers of a search-engine block/CAPTCHA page. Only treated as a block
+# when the page also yields ZERO results (a legit snippet may mention
+# "captcha").
+_BLOCK_MARKERS = ("captcha", "unusual traffic", "automated requests",
+                  "anomaly", "request was filtered", "verify you are human",
+                  "not a robot")
+
+
+def _fetch_error_short(msg):
+    """Shorten a _fetch_raw failure message for the combined search error."""
+    if msg.startswith("FETCH BLOCKED:"):
+        return "blocked: " + msg[len("FETCH BLOCKED:"):].strip()
+    if msg.startswith("FETCH FAILED:"):
+        return msg[len("FETCH FAILED:"):].strip()
+    return msg
+
+
+def _decode_search_body(raw):
+    try:
+        return raw["body"].decode("utf-8")
+    except UnicodeDecodeError:
+        return raw["body"].decode("utf-8", "replace")
+
+
+async def _search_bing(query, _resolver=None):
+    """Bing HTML search. Returns (results, error): results is a list of
+    {title, url, snippet} (possibly empty); error is a string or None."""
+    url = "https://www.bing.com/search?q=" + quote_plus(query)
+    raw = await _fetch_raw(url, _resolver=_resolver, headers=SEARCH_UA)
+    if not raw["ok"]:
+        return [], "Bing " + _fetch_error_short(raw["message"])
+    if raw["status"] != 200:
+        return [], f"Bing returned HTTP {raw['status']} for the search page."
+    text = _decode_search_body(raw)
+    parser = _BingResultsParser()
+    parser.feed(text)
+    results = [r for r in parser.results if r["title"] and r["url"]][:SEARCH_MAX_RESULTS]
+    if not results:
+        low = text.lower()
+        if any(m in low for m in _BLOCK_MARKERS):
+            return [], "Bing showed a CAPTCHA/block page instead of results"
+        return [], "Bing returned no result entries"
+    return results, None
+
+
+async def _search_ddg(query, _resolver=None):
+    """DuckDuckGo HTML search (fallback). Returns (results, error)."""
+    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
     # DDG's edge occasionally answers HTTP 202 ("accepted, not ready") as a
     # transient - one retry after a short pause. This is not a CAPTCHA or a
     # block: a real block page is still reported plainly below, and a second
@@ -394,34 +545,52 @@ async def web_search(query: str, _resolver=None) -> str:
             continue
         break
     if not raw["ok"]:
-        msg = raw["message"]
-        if msg.startswith("FETCH BLOCKED:"):
-            return "SEARCH BLOCKED: " + msg[len("FETCH BLOCKED:"):].strip()
-        if msg.startswith("FETCH FAILED:"):
-            return "SEARCH FAILED: " + msg[len("FETCH FAILED:"):].strip()
-        return "SEARCH FAILED: " + msg
+        return [], "DuckDuckGo " + _fetch_error_short(raw["message"])
     if raw["status"] != 200:
-        return f"SEARCH FAILED: DuckDuckGo returned HTTP {raw['status']} for the search page."
-    try:
-        text = raw["body"].decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw["body"].decode("utf-8", "replace")
+        return [], f"DuckDuckGo returned HTTP {raw['status']} for the search page."
+    text = _decode_search_body(raw)
     parser = _SearchResultsParser()
     parser.feed(text)
     results = [r for r in parser.results if r["title"] and r["url"]][:SEARCH_MAX_RESULTS]
     if not results:
         low = text.lower()
         if any(m in low for m in _BLOCK_MARKERS):
-            return ("SEARCH BLOCKED: DuckDuckGo showed a CAPTCHA/block page instead of results "
-                    f"for '{q}' - do not retry, do not invent results.")
-        return ("SEARCH: no results found for '" + q + "' - the search page returned no result "
-                "entries. Ask the user for the link or try a different query; do not invent results.")
-    lines = [f"SEARCH: {q}"]
-    for i, r in enumerate(results, 1):
-        snip = r["snippet"]
-        if len(snip) > SEARCH_SNIPPET_CHARS:
-            snip = snip[:SEARCH_SNIPPET_CHARS] + "..."
-        lines.append(f"{i}. {r['title']}\n   URL: {r['url']}")
-        if snip:
-            lines.append(f"   Snippet: {snip}")
-    return "\n".join(lines)
+            return [], "DuckDuckGo showed a CAPTCHA/block page instead of results"
+        return [], "DuckDuckGo returned no result entries"
+    return results, None
+
+
+async def web_search(query: str, _resolver=None) -> str:
+    """Search the public web: Bing HTML first, DuckDuckGo HTML as fallback.
+    Returns the top ~8 results as title + URL + snippet.
+
+    Reuses the same SSRF-safe machinery as fetch_url (each search host is
+    validated as public, 20s timeout, size caps). No cookies, no
+    credentials. If both engines fail or return nothing, that fact is
+    returned plainly - results are never invented.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "SEARCH BLOCKED: no query given."
+    results, err_bing = await _search_bing(q, _resolver)
+    if not results:
+        results, err_ddg = await _search_ddg(q, _resolver)
+    if results:
+        lines = [f"SEARCH: {q}"]
+        for i, r in enumerate(results, 1):
+            snip = r["snippet"]
+            if len(snip) > SEARCH_SNIPPET_CHARS:
+                snip = snip[:SEARCH_SNIPPET_CHARS] + "..."
+            lines.append(f"{i}. {r['title']}\n   URL: {r['url']}")
+            if snip:
+                lines.append(f"   Snippet: {snip}")
+        return "\n".join(lines)
+    if (err_bing == "Bing returned no result entries"
+            and err_ddg == "DuckDuckGo returned no result entries"):
+        return ("SEARCH: no results found for '" + q + "' - Bing and DuckDuckGo both "
+                "returned no result entries. Ask the user for the link or try a different "
+                "query; do not invent results.")
+    combined = err_bing + ". DuckDuckGo fallback: " + err_ddg + "."
+    prefix = "SEARCH BLOCKED" if ("CAPTCHA" in combined or "blocked" in combined.lower()) else "SEARCH FAILED"
+    return (f"{prefix}: {combined} Ask the user for the link or try a different "
+            "query; do not invent results.")
