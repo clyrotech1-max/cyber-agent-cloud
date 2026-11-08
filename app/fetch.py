@@ -1,4 +1,5 @@
-"""SSRF-safe read-only web fetch (the agent's `fetch_url` tool).
+"""SSRF-safe read-only web fetch (the agent's `fetch_url` tool) and
+web search (the agent's `web_search` tool, via DuckDuckGo HTML).
 
 Reads any PUBLIC web page or JSON API with a plain GET. Security rules:
 - Only http/https, no credentials in the URL, no cookies sent.
@@ -36,7 +37,7 @@ import re
 import socket
 import ssl
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import httpx
 
@@ -52,6 +53,15 @@ _PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 
 UA = {"User-Agent": "CybnetAI-Cloud/0.4 (read-only-fetch)",
       "Accept": "text/html,application/json,*/*"}
+
+# Web search (v0.4.1): DuckDuckGo HTML endpoint. A browser-like UA is used
+# because the html endpoint serves results pages to browsers; it is not a
+# block bypass - if DDG answers with a CAPTCHA/block page, web_search
+# reports that plainly and never invents results.
+SEARCH_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+             "Accept": "text/html,*/*"}
+SEARCH_MAX_RESULTS = 8
+SEARCH_SNIPPET_CHARS = 300
 
 
 class FetchBlocked(Exception):
@@ -185,25 +195,30 @@ def _readable_text(content_type, body: bytes):
     return "", decoded
 
 
-async def fetch_url(url: str, _resolver=None) -> str:
-    """Fetch a public URL read-only, SSRF-safe. Returns a formatted string.
+async def _fetch_raw(url: str, _resolver=None, headers=None):
+    """Low-level SSRF-safe GET shared by fetch_url and web_search.
 
-    `_resolver` is a test-only seam (defaults to socket.getaddrinfo): it
-    supplies the DNS answers so the validation can be exercised where the
-    local resolver lies (this sandbox's DNS returns synthetic 198.18/15
-    addresses for every public host). Production always uses real DNS.
+    Returns a dict:
+      ok=True  -> {"ok": True, "url": final_url, "status": int,
+                   "content_type": str, "body": bytes, "truncated": bool}
+      ok=False -> {"ok": False, "message": "FETCH BLOCKED: ..." |
+                   "FETCH FAILED: ..." | "FETCH: ... (no Location header)"}
+    Every request (initial + each redirect hop) is validated the same way:
+    the hostname is resolved and EVERY A/AAAA address must be globally
+    routable. 20s timeout per request, 200KB body cap.
     """
     url = (url or "").strip()
     if not url:
-        return "FETCH BLOCKED: no URL given."
+        return {"ok": False, "message": "FETCH BLOCKED: no URL given."}
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        return (f"FETCH BLOCKED: only http/https URLs are allowed, "
-                f"got scheme {parsed.scheme or '(none)'} - give a full URL like https://example.com.")
+        return {"ok": False, "message": (
+            f"FETCH BLOCKED: only http/https URLs are allowed, "
+            f"got scheme {parsed.scheme or '(none)'} - give a full URL like https://example.com.")}
     if not parsed.hostname:
-        return "FETCH BLOCKED: URL has no host."
+        return {"ok": False, "message": "FETCH BLOCKED: URL has no host."}
     if parsed.username or parsed.password:
-        return "FETCH BLOCKED: URLs with embedded credentials are not allowed."
+        return {"ok": False, "message": "FETCH BLOCKED: URLs with embedded credentials are not allowed."}
     ctx = ssl.create_default_context()
     hops = 0
     current = url
@@ -214,27 +229,31 @@ async def fetch_url(url: str, _resolver=None) -> str:
             try:
                 await _validate_host(p.hostname, resolver=_resolver)
             except FetchBlocked as e:
-                return f"FETCH BLOCKED: {e}"
+                return {"ok": False, "message": f"FETCH BLOCKED: {e}"}
             try:
-                async with client.stream("GET", current, headers=UA) as r:
+                async with client.stream("GET", current, headers=headers or UA) as r:
                     status = r.status_code
                     if status in (301, 302, 303, 307, 308):
                         loc = r.headers.get("location")
                         if not loc:
-                            return (f"FETCH: {current} returned HTTP {status} "
-                                    f"with no Location header.")
+                            return {"ok": False, "message": (
+                                f"FETCH: {current} returned HTTP {status} "
+                                f"with no Location header.")}
                         hops += 1
                         if hops > MAX_REDIRECTS:
-                            return (f"FETCH BLOCKED: too many redirects "
-                                    f"(>{MAX_REDIRECTS}) from {url}.")
+                            return {"ok": False, "message": (
+                                f"FETCH BLOCKED: too many redirects "
+                                f"(>{MAX_REDIRECTS}) from {url}.")}
                         nxt = urljoin(current, loc)
                         np = urlparse(nxt)
                         if np.scheme not in ("http", "https"):
-                            return (f"FETCH BLOCKED: redirect to non-http(s) "
-                                    f"URL: {nxt}")
+                            return {"ok": False, "message": (
+                                f"FETCH BLOCKED: redirect to non-http(s) "
+                                f"URL: {nxt}")}
                         if np.username or np.password:
-                            return ("FETCH BLOCKED: redirect to a URL with "
-                                    "embedded credentials.")
+                            return {"ok": False, "message": (
+                                "FETCH BLOCKED: redirect to a URL with "
+                                "embedded credentials.")}
                         current = nxt
                         continue
                     body = bytearray()
@@ -245,23 +264,164 @@ async def fetch_url(url: str, _resolver=None) -> str:
                             body = body[:MAX_BODY_BYTES]
                             truncated = True
                             break
-                    ct = r.headers.get("content-type", "")
-                    title, text = _readable_text(ct, bytes(body))
-                    note = ""
-                    if truncated:
-                        note += (f"\n[NOTE: response truncated at "
-                                 f"{MAX_BODY_BYTES // 1000}KB size cap]")
-                    if len(text) > MAX_TEXT_CHARS:
-                        text = text[:MAX_TEXT_CHARS]
-                        note += (f"\n[NOTE: text truncated at "
-                                 f"{MAX_TEXT_CHARS} characters]")
-                    out = (f"URL: {current}\nStatus: {status}\n"
-                           f"Content-Type: {ct or '(none)'}\n")
-                    if title:
-                        out += f"Title: {title}\n"
-                    return out + f"Content:\n{text}{note}"
+                    return {"ok": True, "url": current, "status": status,
+                            "content_type": r.headers.get("content-type", ""),
+                            "body": bytes(body), "truncated": truncated}
             except httpx.TimeoutException:
-                return (f"FETCH FAILED: timed out after {REQUEST_TIMEOUT}s "
-                        f"fetching {current}.")
+                return {"ok": False, "message": (
+                    f"FETCH FAILED: timed out after {REQUEST_TIMEOUT}s "
+                    f"fetching {current}.")}
             except httpx.HTTPError as e:
-                return f"FETCH FAILED: {type(e).__name__}: {str(e)[:200]}"
+                return {"ok": False, "message": f"FETCH FAILED: {type(e).__name__}: {str(e)[:200]}"}
+
+
+async def fetch_url(url: str, _resolver=None) -> str:
+    """Fetch a public URL read-only, SSRF-safe. Returns a formatted string.
+
+    `_resolver` is a test-only seam (defaults to socket.getaddrinfo): it
+    supplies the DNS answers so the validation can be exercised where the
+    local resolver lies (this sandbox's DNS returns synthetic 198.18/15
+    addresses for every public host). Production always uses real DNS.
+    """
+    raw = await _fetch_raw(url, _resolver=_resolver)
+    if not raw["ok"]:
+        return raw["message"]
+    ct = raw["content_type"]
+    title, text = _readable_text(ct, raw["body"])
+    note = ""
+    if raw["truncated"]:
+        note += (f"\n[NOTE: response truncated at "
+                 f"{MAX_BODY_BYTES // 1000}KB size cap]")
+    if len(text) > MAX_TEXT_CHARS:
+        text = text[:MAX_TEXT_CHARS]
+        note += (f"\n[NOTE: text truncated at "
+                 f"{MAX_TEXT_CHARS} characters]")
+    out = (f"URL: {raw['url']}\nStatus: {raw['status']}\n"
+           f"Content-Type: {ct or '(none)'}\n")
+    if title:
+        out += f"Title: {title}\n"
+    return out + f"Content:\n{text}{note}"
+
+
+# --- DuckDuckGo HTML search results parsing (stdlib html.parser only) ---
+class _SearchResultsParser(HTMLParser):
+    """Parses DuckDuckGo HTML results: title links (class result__a) and
+    snippets (class result__snippet). Result URLs come from the `uddg`
+    parameter of DDG's /l/ redirect links; plain http(s) hrefs are used
+    as-is. A snippet attaches to the most recent result that has none."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results = []  # list of dicts {title, url, snippet}
+        self._cur = None
+        self._capture = None  # "title" | "snippet" | None
+        self._buf = []
+
+    def _real_url(self, href):
+        href = _html.unescape((href or "").strip())
+        if not href:
+            return ""
+        if href.startswith("//"):
+            href = "https:" + href
+        p = urlparse(href)
+        if "duckduckgo.com" in (p.netloc or "") and p.path.startswith("/l/"):
+            uddg = parse_qs(p.query).get("uddg", [None])[0]
+            return (uddg or "").strip()
+        if p.scheme in ("http", "https"):
+            return href
+        return ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        d = dict(attrs)
+        cls = d.get("class", "")
+        if "result__a" in cls:
+            url = self._real_url(d.get("href", ""))
+            if url:
+                self._cur = {"title": "", "url": url, "snippet": ""}
+                self.results.append(self._cur)
+                self._capture = "title"
+                self._buf = []
+        elif "result__snippet" in cls and self._cur is not None and not self._cur["snippet"]:
+            self._capture = "snippet"
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        if tag != "a" or self._capture is None:
+            return
+        text = " ".join("".join(self._buf).split())
+        if self._capture == "title" and self._cur is not None:
+            self._cur["title"] = text
+        elif self._capture == "snippet" and self._cur is not None:
+            self._cur["snippet"] = text
+        self._capture = None
+        self._buf = []
+
+    def handle_data(self, data):
+        if self._capture is not None:
+            self._buf.append(data)
+
+
+# Markers of a DDG block/CAPTCHA page. Only treated as a block when the
+# page also yields ZERO results (a legit snippet may mention "captcha").
+_BLOCK_MARKERS = ("captcha", "unusual traffic", "automated requests",
+                  "anomaly", "request was filtered")
+
+
+async def web_search(query: str, _resolver=None) -> str:
+    """Search the public web via DuckDuckGo HTML. Returns the top ~8
+    results as title + URL + snippet.
+
+    Reuses the same SSRF-safe machinery as fetch_url (html.duckduckgo.com
+    is validated as a public host, 20s timeout, size caps). No cookies,
+    no credentials. If the search page blocks us or returns nothing, that
+    fact is returned plainly - results are never invented.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "SEARCH BLOCKED: no query given."
+    url = "https://html.duckduckgo.com/html/?q=" + quote_plus(q)
+    # DDG's edge occasionally answers HTTP 202 ("accepted, not ready") as a
+    # transient - one retry after a short pause. This is not a CAPTCHA or a
+    # block: a real block page is still reported plainly below, and a second
+    # 202 is reported as a failure, not retried again.
+    raw = None
+    for attempt in range(2):
+        raw = await _fetch_raw(url, _resolver=_resolver, headers=SEARCH_UA)
+        if raw["ok"] and raw["status"] == 202 and attempt == 0:
+            await asyncio.sleep(2)
+            continue
+        break
+    if not raw["ok"]:
+        msg = raw["message"]
+        if msg.startswith("FETCH BLOCKED:"):
+            return "SEARCH BLOCKED: " + msg[len("FETCH BLOCKED:"):].strip()
+        if msg.startswith("FETCH FAILED:"):
+            return "SEARCH FAILED: " + msg[len("FETCH FAILED:"):].strip()
+        return "SEARCH FAILED: " + msg
+    if raw["status"] != 200:
+        return f"SEARCH FAILED: DuckDuckGo returned HTTP {raw['status']} for the search page."
+    try:
+        text = raw["body"].decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw["body"].decode("utf-8", "replace")
+    parser = _SearchResultsParser()
+    parser.feed(text)
+    results = [r for r in parser.results if r["title"] and r["url"]][:SEARCH_MAX_RESULTS]
+    if not results:
+        low = text.lower()
+        if any(m in low for m in _BLOCK_MARKERS):
+            return ("SEARCH BLOCKED: DuckDuckGo showed a CAPTCHA/block page instead of results "
+                    f"for '{q}' - do not retry, do not invent results.")
+        return ("SEARCH: no results found for '" + q + "' - the search page returned no result "
+                "entries. Ask the user for the link or try a different query; do not invent results.")
+    lines = [f"SEARCH: {q}"]
+    for i, r in enumerate(results, 1):
+        snip = r["snippet"]
+        if len(snip) > SEARCH_SNIPPET_CHARS:
+            snip = snip[:SEARCH_SNIPPET_CHARS] + "..."
+        lines.append(f"{i}. {r['title']}\n   URL: {r['url']}")
+        if snip:
+            lines.append(f"   Snippet: {snip}")
+    return "\n".join(lines)
