@@ -7,7 +7,7 @@ from .config import settings, get_extra_domains, add_extra_domain, remove_extra_
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
 from . import auth as authmod
-app = FastAPI(title="Cybnet AI Cloud", version="0.3")
+app = FastAPI(title="Cybnet AI Cloud", version="0.4")
 DB = os.path.join(settings.data_dir, "tasks.db")
 os.makedirs(settings.data_dir, exist_ok=True)
 def db():
@@ -109,6 +109,34 @@ def user_save_settings(body: UserSettingsIn, request: Request):
     if not u:
         return JSONResponse({"error": "Not logged in."}, status_code=401)
     return {"ok": True, "settings": authmod.save_user_settings(u["id"], body.settings)}
+# --- per-user memories (v0.4): durable facts the agent learns. All
+# Bearer-authed; every fact is scoped to the logged-in user's id. ---
+class MemoryIn(BaseModel):
+    fact: str = ""
+@app.get("/user/memories")
+def user_list_memories(request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    return {"ok": True, "memories": authmod.list_memories(u["id"])}
+@app.post("/user/memories")
+def user_add_memory(body: MemoryIn, request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    try:
+        m = authmod.add_memory(u["id"], body.fact)
+        return {"ok": True, "memory": m}
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+@app.delete("/user/memories/{mid}")
+def user_delete_memory(mid: str, request: Request):
+    u = _current_user(request)
+    if not u:
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
+    if not authmod.delete_memory(u["id"], mid):
+        return JSONResponse({"error": "Memory not found."}, status_code=404)
+    return {"ok": True}
 # --- defensive scan (same guardrail + checks as the web scanner) ---
 class ScanIn(BaseModel):
     target: str | None = None
@@ -169,7 +197,7 @@ class TaskIn(BaseModel):
     language: str | None = None
 runtimes = {}
 @app.get("/health")
-def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.3", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
+def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.4", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
 @app.post("/tasks")
 async def create_task(t: TaskIn, request: Request):
     tid = uuid.uuid4().hex[:12]

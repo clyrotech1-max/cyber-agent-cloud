@@ -31,6 +31,7 @@ def _db():
     c.execute("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE, pw_hash TEXT, created TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT, created INTEGER, expires INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS user_data (user_id TEXT, key TEXT, value TEXT, PRIMARY KEY (user_id, key))")
+    c.execute("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, user_id TEXT, fact TEXT, created_at TEXT, updated_at TEXT)")
     return c
 
 
@@ -141,6 +142,7 @@ def change_password(user_id, old_password, new_password):
 def delete_account(user_id):
     c = _db()
     try:
+        c.execute("DELETE FROM memories WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM user_data WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -204,5 +206,48 @@ def save_user_settings(user_id, data):
         )
         c.commit()
         return allowed
+    finally:
+        c.close()
+
+
+# --- per-user memories (v0.4): durable facts the agent learns about the
+# user. Keyed by user id, so one user's memories can never leak to another.
+# Guests have no memory: agent tool use is login-gated in the runtime.
+def list_memories(user_id, limit=20):
+    c = _db()
+    try:
+        rows = c.execute(
+            "SELECT id, fact, created_at, updated_at FROM memories "
+            "WHERE user_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [{"id": r[0], "fact": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
+    finally:
+        c.close()
+
+
+def add_memory(user_id, fact):
+    fact = (fact or "").strip()
+    if not fact:
+        raise ValueError("Fact khali nahi ho sakta.")
+    if len(fact) > 500:
+        fact = fact[:500]
+    c = _db()
+    try:
+        mid = secrets.token_hex(8)
+        c.execute("INSERT INTO memories VALUES (?,?,?,datetime('now'),datetime('now'))",
+                  (mid, user_id, fact))
+        c.commit()
+        return {"id": mid, "fact": fact}
+    finally:
+        c.close()
+
+
+def delete_memory(user_id, mem_id):
+    c = _db()
+    try:
+        cur = c.execute("DELETE FROM memories WHERE id=? AND user_id=?", (mem_id, user_id))
+        c.commit()
+        return cur.rowcount > 0
     finally:
         c.close()
