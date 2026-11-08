@@ -1,4 +1,4 @@
-"""Email + password auth for Cybnet AI (MVP, no paid services).
+"""Email + password auth for Avin (MVP, no paid services).
 
 - Passwords: PBKDF2-HMAC-SHA256, per-user random salt, 600k iterations
   (OWASP recommendation). No password is ever stored or logged in plain text.

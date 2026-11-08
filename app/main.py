@@ -7,7 +7,30 @@ from .config import settings, get_extra_domains, add_extra_domain, remove_extra_
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
 from . import auth as authmod
-app = FastAPI(title="Cybnet AI Cloud", version="0.4")
+app = FastAPI(title="Avin Cloud", version="0.5")
+# --- security headers (P0): added to EVERY response by middleware below.
+# HSTS has no preload (Render is the only ingress; preloading a free-tier
+# custom domain is out of scope). CSP is Report-Only first: Next.js static
+# export needs 'unsafe-inline', so enforce mode would break the UI. ---
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+    "Content-Security-Policy-Report-Only": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests",
+}
+# API paths get Cache-Control: no-store (never cache auth/task/scan data).
+# Static frontend files are served from "/" and are NOT in this list.
+_API_PREFIXES = ("/tasks", "/auth", "/user", "/scan", "/allowed-domains", "/health")
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for k, v in SECURITY_HEADERS.items():
+        response.headers[k] = v
+    if any(request.url.path.startswith(p) for p in _API_PREFIXES):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 DB = os.path.join(settings.data_dir, "tasks.db")
 os.makedirs(settings.data_dir, exist_ok=True)
 def db():
@@ -151,19 +174,28 @@ def _allowed(host, extra):
         return True
     return any(host.startswith(p) for p in ["127.", "10.", "192.168."])
 # --- allowlist management (dashboard sidebar <-> backend) ---
+# Login-gated (v0.5, P0): the allowlist decides what the agent may scan,
+# so only a logged-in user may read or change it. Server defaults are
+# seeded in settings.allowed_domains and are NOT affected by this gate.
 class DomainIn(BaseModel):
     domain: str = ""
 @app.get("/allowed-domains")
-def list_allowed_domains():
+def list_allowed_domains(request: Request):
+    if not _current_user(request):
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
     return {"allowed_domains": all_allowed_domains(), "server_defaults": settings.allowed_domains, "added": get_extra_domains()}
 @app.post("/allowed-domains")
-def add_allowed_domain(body: DomainIn):
+def add_allowed_domain(body: DomainIn, request: Request):
+    if not _current_user(request):
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
     d = add_extra_domain(body.domain)
     if not d:
         return JSONResponse({"error": "Valid domain likho, jaise example.com."}, status_code=400)
     return {"ok": True, "domain": d, "allowed_domains": all_allowed_domains()}
 @app.delete("/allowed-domains/{domain}")
-def delete_allowed_domain(domain: str):
+def delete_allowed_domain(domain: str, request: Request):
+    if not _current_user(request):
+        return JSONResponse({"error": "Not logged in."}, status_code=401)
     remove_extra_domain(domain)
     return {"ok": True, "allowed_domains": all_allowed_domains()}
 _scan_hits = {}
@@ -196,10 +228,48 @@ class TaskIn(BaseModel):
     target: str | None = None
     language: str | None = None
 runtimes = {}
+# --- rate limiting for POST /tasks (v0.5, P0): per-IP windows + a global
+# concurrency cap. In-memory only (resets on restart, like the /scan
+# limiter above it); Render Free restarts are frequent, so this is a
+# tripwire against runaway use, not a billing control. ---
+# (window_seconds, max_requests, human label)
+_TASK_RATE_WINDOWS = (
+    (60, 3, "3 tasks per minute"),
+    (3600, 20, "20 tasks per hour"),
+    (86400, 30, "30 tasks per day"),
+)
+_task_hits = {}  # client ip -> [unix timestamps of accepted creates]
+_TASK_SEM = asyncio.Semaphore(3)  # at most 3 tasks actually running
+def _client_ip(request: Request):
+    # Render is the sole ingress and appends the connecting IP to
+    # X-Forwarded-For; the RIGHTMOST value is the IP that actually
+    # connected to Render and cannot be forged by the client, so it is
+    # the rate-limit key. Falls back to the direct peer address.
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff:
+        return xff.split(",")[-1].strip() or "unknown"
+    return (request.client.host if request.client else "unknown") or "unknown"
+def _task_rate_check(ip):
+    """Returns (allowed, error_message, retry_after_s). Records the hit
+    when allowed. Windows are checked smallest-first."""
+    now = time.time()
+    arr = [t for t in _task_hits.get(ip, []) if now - t < 86400]
+    for window, limit, label in _TASK_RATE_WINDOWS:
+        in_window = [t for t in arr if now - t < window]
+        if len(in_window) >= limit:
+            retry_after = int(window - (now - min(in_window))) + 1
+            return False, f"Rate limit: {label}. Please wait {retry_after}s and try again.", retry_after
+    arr.append(now)
+    _task_hits[ip] = arr
+    return True, None, None
 @app.get("/health")
-def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.4", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
+def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.5", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
 @app.post("/tasks")
 async def create_task(t: TaskIn, request: Request):
+    ip = _client_ip(request)
+    allowed, msg, retry_after = _task_rate_check(ip)
+    if not allowed:
+        return JSONResponse({"error": msg}, status_code=429, headers={"Retry-After": str(retry_after)})
     tid = uuid.uuid4().hex[:12]
     c = db(); c.execute("INSERT INTO tasks VALUES (?,?,?,?,datetime('now'))", (tid, t.prompt, "running", "")); c.commit(); c.close()
     # Login is optional to open/use the web, but agent WORK needs a login:
@@ -209,19 +279,22 @@ async def create_task(t: TaskIn, request: Request):
     rt = AgentRuntime(settings, tid, t.prompt, t.target, authed=bool(u), user_id=u["id"] if u else None, language=t.language)
     runtimes[tid] = rt
     async def _run():
-        try:
-            out = await rt.run()
-            c = db()
-            # A task the user cancelled stays cancelled: a late "completed"
-            # from an in-flight step must not overwrite the cancelled status.
-            cur = c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
-            if cur and cur[0] == "cancelled":
-                c.execute("UPDATE tasks SET result=? WHERE id=?", (json.dumps(out)[:20000], tid))
-            else:
-                c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", (out.get("status"), json.dumps(out)[:20000], tid))
-            c.commit(); c.close()
-        except Exception as e:
-            c = db(); c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", ("failed", str(e), tid)); c.commit(); c.close()
+        # At most 3 tasks run at once; extra creates wait here (their DB
+        # status stays "running" while queued).
+        async with _TASK_SEM:
+            try:
+                out = await rt.run()
+                c = db()
+                # A task the user cancelled stays cancelled: a late "completed"
+                # from an in-flight step must not overwrite the cancelled status.
+                cur = c.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+                if cur and cur[0] == "cancelled":
+                    c.execute("UPDATE tasks SET result=? WHERE id=?", (json.dumps(out)[:20000], tid))
+                else:
+                    c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", (out.get("status"), json.dumps(out)[:20000], tid))
+                c.commit(); c.close()
+            except Exception as e:
+                c = db(); c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", ("failed", str(e), tid)); c.commit(); c.close()
     asyncio.create_task(_run())
     return {"task_id": tid, "status": "running"}
 @app.get("/tasks/{tid}")

@@ -60,7 +60,7 @@ MAX_REDIRECTS = 3
 # no proxy env, so this is None and httpx connects directly.
 _PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 
-UA = {"User-Agent": "CybnetAI-Cloud/0.4 (read-only-fetch)",
+UA = {"User-Agent": "Avin-Cloud/0.5 (read-only-fetch)",
       "Accept": "text/html,application/json,*/*"}
 
 # Web search (v0.4.1/v0.4.2): Bing HTML is primary, DuckDuckGo HTML the
