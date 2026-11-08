@@ -8,7 +8,7 @@ from ..providers.gemini import GeminiProvider
 from ..scan import run_full_scan
 from ..fetch import fetch_url, web_search
 from .. import auth as authmod
-SYSTEM = """You are Cybnet AI, a cloud autonomous agent. You work by calling tools.
+SYSTEM = """You are Avin, a cloud autonomous agent. You work by calling tools.
 LANGUAGE: Reply in the exact script and language the user used: Roman Urdu (Latin letters) in -> Roman Urdu out; Urdu script in -> Urdu script out; English in -> English out. Never switch scripts - a Roman Urdu question gets a Roman Urdu answer, never Urdu script. If the user explicitly asks for a language, stay in that language for the whole conversation. The website UI is English, but your chat replies follow the user's language.
 NO FABRICATION - report only what tools actually returned: Never claim a site, search engine, or service blocked you, timed out, or refused access unless a tool call actually returned that exact block or error - quote the tool's own words and stop there. Never invent a technical excuse for not knowing something. If the user asks about a website and gives no URL, first use web_search to find it, then fetch_url to read it; if search finds nothing, ask the user for the link. If a tool fails, say exactly what it returned. Never guess a URL, a fact, or a reason - say you do not know and ask.
 Reply with ONE JSON object only: {"plan": "...", "tool": "write_file|run_command|read_file|list_files|scan|fetch_url|web_search|remember|finish", "args": {...}, "verify": "how to verify this step"}
@@ -16,14 +16,14 @@ Tool argument names are EXACT - use only these:
 - write_file: {"path": "hello.py", "content": "..."}
 - read_file: {"path": "hello.py"}
 - list_files: {}
-- run_command: {"cmd": "python3 hello.py"}
+- run_command: {"cmd": "ls -la"}
 - scan: {"target": "example.com"}
 - fetch_url: {"url": "https://example.com"}
 - web_search: {"query": "Daily Hayat news"}
 - remember: {"fact": "The user prefers ..."}
 - finish: {"result": "..."}
 Never use "filename", "file", or "command" as argument names.
-For a coding task: write files, run them, read the real error, fix it, run again.
+For a coding task: write files, then inspect them with read-only commands (cat/head/tail/grep/ls) - code cannot be executed in this sandbox, so verify by reading the code carefully, never by running it.
 Never claim success without a successful run. If a tool fails, fix the cause and retry, max 3 retries per step.
 If the task is a simple greeting or question that needs no tools, call finish immediately with a short direct answer - do not list files, run commands, or write report sections for it.
 REPORT FORMAT - your finish result is ONE clean answer first, then the details, in this exact order. Never dump headings and sections in a random order, never repeat a section, never paste the scan tool's output.
@@ -54,6 +54,25 @@ def login_message(prompt):
     if words & roman_markers:
         return LOGIN_MESSAGES["ur"]
     return LOGIN_MESSAGES["en"]
+class LLMJsonError(ValueError):
+    """The model returned invalid/truncated JSON even after repair retries.
+    This is NOT a task failure: run() ends the task gracefully instead."""
+    pass
+
+
+def _json_fail_message(prompt):
+    """Short, clear message when the model's reply could not be read,
+    in the user's own language (same detection as login_message)."""
+    p = (prompt or "")
+    if any("\u0600" <= ch <= "\u06ff" for ch in p):
+        return "Maazrat — aapka jawab tayyar karte hue main atak gaya (model ka jawab parha nahi ja saka). Barah-e-karam apna sawal dobara bhej dein."
+    words = set(p.lower().replace("?", " ").replace("!", " ").replace(".", " ").replace(",", " ").split())
+    roman_markers = {"kya", "hai", "hain", "kro", "karo", "kar", "batao", "bata", "meri", "mera", "mujhe", "mujhy", "chahta", "chahti", "chahiye", "ye", "wo", "ka", "ki", "ko", "mein", "me", "par", "ap", "aap", "pehly", "pehle", "phir", "site", "check"}
+    if words & roman_markers:
+        return "Maazrat — aapka jawab tayyar karte hue main atak gaya (model ka jawab parha nahi ja saka). Barah-e-karam apna sawal dobara bhej dein."
+    return "Sorry — I hit a snag preparing your answer (the model's reply could not be read). Please send your message again."
+
+
 class AgentRuntime:
     def __init__(self, settings, task_id, prompt, target=None, authed=False, user_id=None, language=None):
         self.s = settings; self.task_id = task_id; self.prompt = prompt; self.target = target
@@ -118,21 +137,32 @@ class AgentRuntime:
             task_line += f"\nReply language (user's setting): {lang_names.get(self.language, self.language)} - reply ONLY in this language for the whole conversation."
         base = SYSTEM + task_line + "\n\nHistory (real tool outputs):\n" + json.dumps(history[-6:], indent=2)[:6000]
         last_raw = ""
-        for attempt in range(2):
-            text, model = await self.provider.generate(base if attempt == 0 else base + "\n\nYour last reply was not valid JSON. Reply with ONLY the JSON object, no other text, no markdown fences.")
+        # Up to 2 repair retries (3 attempts total): each retry sends the
+        # model its own raw reply so it can fix the JSON itself. If the
+        # reply is still unreadable, raise LLMJsonError - run() ends the
+        # task gracefully instead of marking it "failed".
+        for attempt in range(3):
+            if attempt == 0:
+                prompt = base
+            else:
+                prompt = (base + "\n\nYour last reply was not valid JSON. Here is exactly what you returned:\n"
+                          + last_raw[:500]
+                          + "\n\nReply with ONLY the complete JSON object, no other text, no markdown fences. "
+                            "If your previous reply was cut off, return the full JSON object again from the start.")
+            text, model = await self.provider.generate(prompt)
             last_raw = text
             start, end = text.find("{"), text.rfind("}")
             if start < 0:
-                if attempt == 0:
+                if attempt < 2:
                     continue
-                raise ValueError(f"LLM returned no JSON (model {model}, raw: {text[:300]!r})")
+                raise LLMJsonError(f"LLM returned no JSON after 3 attempts (model {model}, raw: {text[:300]!r})")
             try:
                 return json.loads(text[start:end+1]), model
             except Exception:
-                if attempt == 0:
+                if attempt < 2:
                     continue
-                raise ValueError(f"LLM returned invalid JSON (model {model}, raw: {text[:300]!r})")
-        raise ValueError(f"LLM returned no JSON, raw: {last_raw[:300]!r}")
+                raise LLMJsonError(f"LLM returned invalid JSON after 3 attempts (model {model}, raw: {text[:300]!r})")
+        raise LLMJsonError(f"LLM returned no JSON, raw: {last_raw[:300]!r}")
     async def run(self, on_step=None):
         history = []
         t0 = time.time()
@@ -141,6 +171,16 @@ class AgentRuntime:
             if time.time() - t0 > self.s.task_timeout_s: return {"status": "timeout", "steps": self.steps}
             try:
                 step, model = await self._llm_step(history)
+            except LLMJsonError:
+                # The model kept returning unreadable JSON: do NOT fail the
+                # task - end it gracefully with a clear message asking the
+                # user to retry. The raw error is recorded in the steps.
+                msg = _json_fail_message(self.prompt)
+                self.steps.append({"step": step_no, "plan": "read model reply",
+                                   "tool": "finish", "args": {"result": msg},
+                                   "observation": "model reply was not valid JSON after 3 attempts",
+                                   "model": "n/a"})
+                return {"status": "completed", "result": msg, "steps": self.steps, "files": self.ws.list_files()}
             except Exception as e:
                 return {"status": "failed", "error": str(e), "steps": self.steps}
             # Stop takes effect even mid-step: if the user cancelled while the
