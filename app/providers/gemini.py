@@ -15,16 +15,22 @@ MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.8-flash-lite", 
 class GeminiProvider:
     def __init__(self, api_key, model="gemini-3.5-flash-lite"):
         self.key = api_key; self.model = model
-    async def generate(self, prompt, timeout=20):
+    async def generate(self, prompt, timeout=20, images=None):
+        """images: optional list of (mime_type, base64_data) for multimodal
+        inlineData parts (PNG/JPEG/WebP). Sent on the same contents turn
+        as the text prompt so the model can actually see the images."""
         if not self.key:
             raise RuntimeError("GEMINI_API_KEY not set - set it in the cloud backend env, never in chat/repo")
+        parts = [{"text": prompt}]
+        for mime, b64 in (images or []):
+            parts.append({"inlineData": {"mimeType": mime, "data": b64}})
         errors = {}
         for m in dict.fromkeys(MODELS + [self.model]):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as c:
                     r = await c.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
                         headers={"Content-Type": "application/json", "x-goog-api-key": self.key},
-                        json={"contents": [{"parts": [{"text": prompt}]}]})
+                        json={"contents": [{"parts": parts}]})
                     j = r.json()
                     text = "".join(p.get("text", "") for p in j.get("candidates", [{}])[0].get("content", {}).get("parts", []))
                     if r.status_code == 200 and text: return text, m
