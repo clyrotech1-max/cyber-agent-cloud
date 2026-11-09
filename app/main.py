@@ -7,7 +7,7 @@ from .config import settings, get_extra_domains, add_extra_domain, remove_extra_
 from .agent.runtime import AgentRuntime
 from .scan import run_full_scan, build_report
 from . import auth as authmod
-app = FastAPI(title="Avin Cloud", version="0.5")
+app = FastAPI(title="Avin Cloud", version="0.6")
 # --- security headers (P0): added to EVERY response by middleware below.
 # HSTS has no preload (Render is the only ingress; preloading a free-tier
 # custom domain is out of scope). CSP is Report-Only first: Next.js static
@@ -263,21 +263,82 @@ def _task_rate_check(ip):
     _task_hits[ip] = arr
     return True, None, None
 @app.get("/health")
-def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.5", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
+def health(): return {"ok": True, "service": "cybnet-ai-cloud", "version": "0.6", "gemini_configured": bool(settings.gemini_api_key), "allowed_domains": settings.allowed_domains}
+# --- file attachments (v0.6): POST /tasks accepts EITHER a JSON body
+# (as before) OR multipart/form-data with a `prompt` field plus one or
+# more `files` fields. Guests may chat but may NOT upload files.
+# Uploads live only in the task's isolated workspace (uploads/) and are
+# never served back publicly and never executed. ---
+from .attachments import validate_upload, MAX_FILES
 @app.post("/tasks")
-async def create_task(t: TaskIn, request: Request):
+async def create_task(request: Request):
     ip = _client_ip(request)
     allowed, msg, retry_after = _task_rate_check(ip)
     if not allowed:
         return JSONResponse({"error": msg}, status_code=429, headers={"Retry-After": str(retry_after)})
+    u = _current_user(request)
+    prompt, target, language = "", None, None
+    uploads = []  # list of (filename, bytes)
+    ct = request.headers.get("content-type", "")
+    if ct.startswith("multipart/form-data") or ct.startswith("application/x-www-form-urlencoded"):
+        # Form posts (multipart with files, or plain urlencoded with no
+        # files) share the same parsing path.
+        try:
+            form = await request.form()
+        except Exception as e:
+            return JSONResponse({"error": f"Could not read the uploaded form: {e}"}, status_code=400)
+        prompt = (form.get("prompt") or "").strip()
+        target = form.get("target") or None
+        language = form.get("language") or None
+        for f in form.getlist("files"):
+            uploads.append((getattr(f, "filename", "") or "file", await f.read()))
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Send a JSON body {\"prompt\": \"...\"} or a multipart form with a prompt field."}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Send a JSON body {\"prompt\": \"...\"}."}, status_code=400)
+        prompt = (body.get("prompt") or "").strip()
+        target = body.get("target")
+        language = body.get("language")
+    if not prompt:
+        return JSONResponse({"error": "Prompt likho — a prompt is required."}, status_code=400)
+    # Validate ALL uploads before creating the task (a rejected file must
+    # not leave an orphan task behind).
+    if uploads and not u:
+        return JSONResponse({"error": "Pehly login karein - files attach karne ke liye login zaroori hai."}, status_code=401)
+    if len(uploads) > MAX_FILES:
+        return JSONResponse({"error": f"At most {MAX_FILES} files per task (got {len(uploads)})."}, status_code=400)
+    metas = []
+    for filename, data in uploads:
+        meta, err = validate_upload(filename, data)
+        if err:
+            return JSONResponse({"error": err}, status_code=400)
+        metas.append((meta, data))
     tid = uuid.uuid4().hex[:12]
-    c = db(); c.execute("INSERT INTO tasks VALUES (?,?,?,?,datetime('now'))", (tid, t.prompt, "running", "")); c.commit(); c.close()
+    c = db(); c.execute("INSERT INTO tasks VALUES (?,?,?,?,datetime('now'))", (tid, prompt, "running", "")); c.commit(); c.close()
     # Login is optional to open/use the web, but agent WORK needs a login:
     # the runtime answers greetings + general questions when logged out, and
     # asks the user to log in first for any work needing tools.
-    u = _current_user(request)
-    rt = AgentRuntime(settings, tid, t.prompt, t.target, authed=bool(u), user_id=u["id"] if u else None, language=t.language)
+    rt = AgentRuntime(settings, tid, prompt, target, authed=bool(u), user_id=u["id"] if u else None, language=language)
     runtimes[tid] = rt
+    saved = []
+    used_names = set()
+    for meta, data in metas:
+        name = meta["name"]
+        # De-duplicate sanitized names so two "a.txt" uploads don't collide.
+        stem, dot, ext = name.rpartition(".")
+        base, n = (stem if dot else name), 2
+        while name in used_names:
+            name = f"{base}-{n}.{ext}" if dot else f"{base}-{n}"
+            n += 1
+        used_names.add(name)
+        meta = dict(meta, name=name, rel=f"uploads/{name}")
+        rt.ws.write_bytes(meta["rel"], data)
+        saved.append(meta)
+    if saved:
+        rt.attach_files(saved)
     async def _run():
         # At most 3 tasks run at once; extra creates wait here (their DB
         # status stays "running" while queued).
@@ -296,7 +357,8 @@ async def create_task(t: TaskIn, request: Request):
             except Exception as e:
                 c = db(); c.execute("UPDATE tasks SET status=?, result=? WHERE id=?", ("failed", str(e), tid)); c.commit(); c.close()
     asyncio.create_task(_run())
-    return {"task_id": tid, "status": "running"}
+    return {"task_id": tid, "status": "running",
+            "files": [{"name": m["name"], "size": m["size"], "kind": m["kind"]} for m in saved]}
 @app.get("/tasks/{tid}")
 def get_task(tid: str):
     c = db(); row = c.execute("SELECT id,prompt,status,result FROM tasks WHERE id=?", (tid,)).fetchone(); c.close()
