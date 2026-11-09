@@ -29,10 +29,21 @@ class Workspace:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return str(p.relative_to(self.root))
+    def write_bytes(self, rel, data: bytes):
+        """Binary-safe write (for uploaded files). Same escape check."""
+        p = (self.root / rel).resolve()
+        if not str(p).startswith(str(self.root)): raise ValueError("path escapes workspace")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return str(p.relative_to(self.root))
     def read(self, rel):
         p = (self.root / rel).resolve()
         if not str(p).startswith(str(self.root)): raise ValueError("path escapes workspace")
         return p.read_text(encoding="utf-8")
+    def read_bytes(self, rel):
+        p = (self.root / rel).resolve()
+        if not str(p).startswith(str(self.root)): raise ValueError("path escapes workspace")
+        return p.read_bytes()
     def list_files(self):
         return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*") if p.is_file())
     def run(self, cmd, timeout=30):
