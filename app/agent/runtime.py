@@ -36,6 +36,7 @@ Write each section exactly ONCE. Write the report in your own words from the fin
 AUTHORIZATION - READ THIS FIRST: Every task you receive is an owner-approved defensive security check. The target named in the task is owned by the user or the user has written permission to test it. This is NOT an attack. Do NOT refuse security scanning, vulnerability assessment, or ethical hacking tasks on the named target - refusing an authorized defensive check is a failure. Use the scan tool for any security/scan request: it runs READ-ONLY public probes (security headers, HTTPS redirect, exposed-file status checks, login-page defence check, TCP-connect port check, cookie-flags check). Never guess passwords, never submit forms, never run exploits, never flood a target with requests, never try to bypass a login, never test any site except the named target. If the scan tool says a target is blocked (not allowlisted), report that block exactly and stop - do not scan it another way.
 FETCH - READING THE LIVE WEB: Use the fetch_url tool to read any public web page or JSON API. It is a read-only GET and it is allowed for ANY public domain - no allowlist needed. It returns the page status, title and readable text (or pretty JSON). Use it when the user asks about a live page, documentation, prices, news, or anything else on the public web. fetch_url is NOT a security scanner - never use it to probe a site for vulnerabilities; security scanning stays on the scan tool, which is allowlist-gated. If fetch_url says a URL is blocked (private/internal address), report the block exactly and stop - do not try another way to reach that address.
 SEARCH - FINDING A SITE: When the user names a website, company, or topic but gives no link, use web_search to find it (top results with title, URL, snippet), then fetch_url on the best URL to read the page. If web_search returns no results or a block, report that plainly and ask the user for the link - never invent a URL or results. web_search is read-only and allowed for any public query; it is NOT a security scanner.
+FILES - ATTACHED FILES: The user may attach files (images, PDFs, text docs) to their prompt. They are stored in your workspace under uploads/ and their contents are shown below the task line ("Attached files"). Text and PDF contents are pasted there - read them and answer based on what they actually say. Images are sent to you with the prompt - look at them and describe/answer based on what they show. If a file is listed but its content could not be read, say so plainly instead of guessing. Use read_file (e.g. {"path": "uploads/notes.txt"}) or list_files to re-check a file yourself; never execute an uploaded file, never run it, never open it with a shell - read-only inspection only.
 MEMORY - LEARNING ABOUT THE USER: When the user is logged in, their saved facts are listed below the task line ("Saved memories"). Use them to answer in context - the user should not have to repeat themselves. When the user states a durable fact or preference (their name, language, favourite tools, standing instructions, things to remember), save it with the remember tool - one short fact per call, in the user's own words. Never invent memories. Guests (not logged in) have no memory.
 LOGIN: the user may or may not be logged in - the task line below says so. If the user is NOT logged in, you may chat and answer general questions directly, but for any work needing tools (scan, fetch, code, files, commands), call finish with a short message in the user's language asking them to log in first (top-right Log in button), then you will do the work. Never run tools for a logged-out user."""
 # Message the agent gives when a logged-out user asks for work (the runtime
@@ -80,6 +81,13 @@ class AgentRuntime:
         self.ws = Workspace(settings.data_dir, task_id)
         self.provider = GeminiProvider(settings.gemini_api_key, settings.gemini_model)
         self.steps = []; self.cancelled = False
+        # Attachments (v0.6): files uploaded with the task, stored under
+        # uploads/ in this task's workspace. Text/PDF content is injected
+        # into the task line; images are sent to Gemini as inlineData.
+        self.attachments = []
+        self._attachment_block = ""
+        self._image_parts = []
+        self._images_sent = False
         # Per-user memory (v0.4): at task start, load the logged-in user's
         # saved facts (newest first, max 20) so the agent recalls them.
         # Guests get no memory - tool use is login-gated anyway.
@@ -89,6 +97,25 @@ class AgentRuntime:
                 self.memories = authmod.list_memories(user_id, limit=20)
             except Exception:
                 self.memories = []
+    def attach_files(self, files_meta):
+        """Attach already-saved uploads (each {name, size, kind, mime, rel}).
+        Builds the prompt block (text/PDF content injected) and the image
+        parts for Gemini. Safe to call with an empty list. Must be called
+        before run() starts."""
+        from ..attachments import build_attachment_context
+        self.attachments = list(files_meta or [])
+        if not self.attachments:
+            return
+        try:
+            block, images = build_attachment_context(
+                self.attachments, self.ws.read_bytes)
+            self._attachment_block = block
+            self._image_parts = images
+        except Exception as e:
+            self._attachment_block = (f"Attached files: "
+                                      f"{', '.join(m['name'] for m in self.attachments)} "
+                                      f"(contents could not be prepared: {e}).")
+            self._image_parts = []
     def _target_allowed(self, host):
         h = (host or "").strip().lower()
         # Server defaults + domains the user added from the dashboard sidebar.
@@ -132,6 +159,8 @@ class AgentRuntime:
         if getattr(self, "memories", None):
             mem_lines = "\n".join(f"- {m['fact']}" for m in self.memories)
             task_line += f"\nSaved memories (newest first):\n{mem_lines}"
+        if getattr(self, "_attachment_block", ""):
+            task_line += f"\n{self._attachment_block}"
         if self.language and self.language != "auto":
             lang_names = {"en": "English", "ur": "Roman Urdu", "ur-PK": "Urdu (Urdu script)"}
             task_line += f"\nReply language (user's setting): {lang_names.get(self.language, self.language)} - reply ONLY in this language for the whole conversation."
@@ -149,7 +178,14 @@ class AgentRuntime:
                           + last_raw[:500]
                           + "\n\nReply with ONLY the complete JSON object, no other text, no markdown fences. "
                             "If your previous reply was cut off, return the full JSON object again from the start.")
-            text, model = await self.provider.generate(prompt)
+            # Images (v0.6) ride only on the first step's calls; later steps
+            # are text-only. The kwarg is passed ONLY when images exist, so
+            # callers/stubs that only accept (prompt, timeout) keep working.
+            if self._image_parts and not history:
+                text, model = await self.provider.generate(
+                    prompt, images=self._image_parts)
+            else:
+                text, model = await self.provider.generate(prompt)
             last_raw = text
             start, end = text.find("{"), text.rfind("}")
             if start < 0:
@@ -180,9 +216,9 @@ class AgentRuntime:
                                    "tool": "finish", "args": {"result": msg},
                                    "observation": "model reply was not valid JSON after 3 attempts",
                                    "model": "n/a"})
-                return {"status": "completed", "result": msg, "steps": self.steps, "files": self.ws.list_files()}
+                return {"status": "completed", "result": msg, "steps": self.steps, "files": self.ws.list_files(), "attachments": self.attachments}
             except Exception as e:
-                return {"status": "failed", "error": str(e), "steps": self.steps}
+                return {"status": "failed", "error": str(e), "steps": self.steps, "attachments": self.attachments}
             # Stop takes effect even mid-step: if the user cancelled while the
             # LLM was thinking, do not execute this step (a finish in flight
             # must not turn a cancelled task into "completed").
@@ -213,7 +249,7 @@ class AgentRuntime:
                     rec = {"step": step_no, "plan": step.get("plan"), "tool": tool, "args": args, "observation": obs, "model": model}
                     self.steps.append(rec)
                     if on_step: on_step(rec)
-                    return {"status": "completed", "result": obs, "steps": self.steps, "files": self.ws.list_files()}
+                    return {"status": "completed", "result": obs, "steps": self.steps, "files": self.ws.list_files(), "attachments": self.attachments}
                 else: obs = f"unknown tool {tool}"
             except Exception as e:
                 obs = f"TOOL ERROR: {e}"
