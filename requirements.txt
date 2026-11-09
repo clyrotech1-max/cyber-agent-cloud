@@ -3,3 +3,5 @@ uvicorn[standard]==0.38.0
 httpx==0.28.1
 pydantic==2.12.5
 aiofiles==24.1.0
+pypdf==7.0.0
+python-multipart==0.0.33
